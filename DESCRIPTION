@@ -36,6 +36,7 @@ Imports:
     stats,
     utils
 Suggests:
+    S4Vectors,
     SingleCellExperiment,
     SummarizedExperiment,
     scuttle,
