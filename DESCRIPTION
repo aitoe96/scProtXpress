@@ -1,0 +1,50 @@
+Package: scProtXpress
+Title: Single-cell Protein Expression Discretisation (CyTOF + CITE-seq)
+Version: 0.1.0
+Authors@R: c(
+    person(given = "Andoni",
+           family = "Perez",
+           role = c("aut", "cre"),
+           email = "amperez@cicbiogune.es"))
+Description: scProtXpress quantifies single-cell protein expression at the
+    cell-type level by aligning samples to per-marker landmarks (ADTnorm-style
+    negative / valley / positive peaks), discretising query cells against the
+    bootstrap thresholds of a reference, and calling expression levels per
+    population with a binomial test on the discretised matrix. The same
+    pipeline handles CyTOF and CITE-seq inputs through a single
+    `run_scProteinXpress()` entry point that dispatches modality-specific
+    ingest while sharing every downstream step (QC, bootstrap, discretisation,
+    signature frame, expression-level call).
+License: GPL-3
+URL: https://github.com/yourorg/scProtXpress
+BugReports: https://github.com/yourorg/scProtXpress/issues
+Encoding: UTF-8
+LazyData: false
+Depends:
+    R (>= 4.1.0)
+Imports:
+    ADTnorm,
+    Matrix,
+    flowCore,
+    foreach,
+    doParallel,
+    parallel,
+    stats,
+    utils
+Suggests:
+    SingleCellExperiment,
+    SummarizedExperiment,
+    scuttle,
+    sparseMatrixStats,
+    RhpcBLASctl,
+    tictoc,
+    ggplot2,
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+Remotes:
+    github::yezhengSTAT/ADTnorm
+Config/testthat/edition: 3
+VignetteBuilder: knitr
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2

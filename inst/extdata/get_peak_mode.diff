@@ -1,0 +1,185 @@
+--- ADTnorm-main/R/get_peak_mode.R	2025-07-08 19:44:03.000000000 +0200
++++ cytof_scProt/get_peak_mode_patched.R	2026-05-18 15:03:42.980976897 +0200
+@@ -1,30 +1,54 @@
+-#' Get the peak landmarks location using the peak mode
+-#'
+-#' This function detects the peak mode locations for each sample per ADT markers. Using the peak mode instead of the peak region midpoint can be more accurate in determining the peak location if the bandwidth is generally proper and the local peak density is not too discrete.
+-#' @param cell_x_adt Matrix of ADT raw counts in cells (rows) by ADT markers (columns) format.
+-#' @param cell_x_feature Matrix of cells (rows) by cell features (columns) such as cell type, sample, and batch-related information.
+-#' @param adt_marker_select Markers to normalize. Leaving empty to process all the ADT markers in the cell_x_adt matrix.
+-#' @param adt_marker_index Index of the ADT markers that will be normalized. Leaving empty if adt_marker_select is not specified.
+-#' @param bwFac_smallest The smallest bandwidth parameter value. Recommend 1.1 for general bi-modal ADT markers except for CD3, CD4, and CD8.
+-#' @param bimodal_marker_index Index of the ADT markers that tend to have two peaks based on researchers' prior knowledge or preliminary observation on particular data to be processed.
+-#' @param trimodal_marker_index Index of the ADT markers that tend to have three peaks based on researchers' prior knowledge (e.g., CD4) or preliminary observation on particular data to be processed.
+-#' @param positive_peak A list variable containing a vector of ADT marker(s) and a corresponding vector of sample name(s) in matching order to specify that the uni-peak detected should be aligned to positive peaks. For example, for samples that only contain T cells. The only CD3 peak should be aligned with the positive peaks of other samples.
+-#' @param neg_candidate_thres The upper bound for the negative peak. Users can refer to their IgG samples to obtain the minimal upper bound of the IgG sample peak. It can be one of the values of asinh(4/5+1), asinh(6/5+1), or asinh(8/5+1) if the right 95% quantile of IgG samples is large.
+-#' @param lower_peak_thres The minimal ADT marker density height to call it a real peak. Set it to 0.01 to avoid suspicious positive peaks. Set it to 0.001 or smaller to include some small but tend to be real positive peaks, especially for markers like CD19.
+-#' @param arcsinh_transform_flag The flag indicates if the input is raw count and arcsinh transformation is implemented.
+-#' @export
+-#' @examples
+-#' \dontrun{
+-#' get_peak_mode(
+-#'   cell_x_adt = cell_x_adt,
+-#'   cell_x_feature = cell_x_feature,
+-#'   adt_marker_select = "CD3",
+-#'   neg_candidate_thres = asinh(6/5+1)
+-#' )
+-#' }
+-# require(flowStats)
+-# require(dplyr)
+-get_peak_mode = function(cell_x_adt = NULL, cell_x_feature = NULL, adt_marker_select = NULL, adt_marker_index = NULL, bwFac_smallest = 1.1, bimodal_marker_index = NULL, trimodal_marker_index = NULL, positive_peak = NULL, neg_candidate_thres = asinh(10/5 + 1), lower_peak_thres = 0.001, arcsinh_transform_flag = TRUE) {
++###############################################################################
++# get_peak_mode_patched.R
++#
++# Local patched copy of ADTnorm::get_peak_mode().
++#
++# (a) Status
++#     This file is a verbatim copy of ADTnorm/R/get_peak_mode.R from the
++#     local fork at scProt/scripts/final_code/ADTnorm-main/ (snapshot
++#     dated 2025-07-08; corresponds to the ADTnorm GitHub `main` branch
++#     at https://github.com/yezhengSTAT/ADTnorm). The function is
++#     re-exposed under an internal-only name: `.get_peak_mode_patched()`.
++#     `ADTnorm::get_peak_mode()` is NOT modified; the pipeline only ever
++#     calls `.get_peak_mode_patched()`.
++#
++# (b) Patch
++#     Twelve `[mask, ]` subsetting expressions on `peak_info$regions`,
++#     `res_region` and `res_regionTmp` collapse 1-row matrices to a
++#     length-2 numeric vector, which silently corrupts the downstream
++#     write `peak_region[[sample_name]][1:length(res), ] = res_region`
++#     when the mask selects exactly one row. Each site is patched with
++#     `, drop = FALSE`. No other changes are made.
++#
++# (c) The twelve patch sites. Each row gives (upstream line in
++#     ADTnorm-main/R/get_peak_mode.R, line in this file after header,
++#     short identifier).
++#       upstream L126 / here L149 - res_region = peak_info$regions[peak_ind, , drop = FALSE]            (trimodal)
++#       upstream L198 / here L221 - res_region = peak_info$regions[peak_ind, , drop = FALSE]            (bimodal len > 2)
++#       upstream L227 / here L250 - res_region = peak_info$regions[<mask>, , drop = FALSE]              (bimodal fres0)
++#       upstream L234 / here L257 - same shape, different scope
++#       upstream L260 / here L283 - same shape, different scope
++#       upstream L293 / here L316 - same shape, different scope
++#       upstream L298 / here L321 - same shape, different scope
++#       upstream L303 / here L326 - same shape, different scope
++#       upstream L326 / here L349 - res_regionTmp = peak_infoTmp$regions[<mask>, , drop = FALSE]
++#       upstream L336 / here L359 - res_regionTmp = res_regionTmp[indTmp, , drop = FALSE]
++#       upstream L353 / here L376 - res_region = res_region[-1, , drop = FALSE]
++#       upstream L361 / here L384 - res_region = peak_info$regions[which(<...>), , drop = FALSE]
++#
++#     For machine-readable form see `cytof_scProt/get_peak_mode.diff`
++#     (output of `diff -u ADTnorm-main/R/get_peak_mode.R
++#                          cytof_scProt/get_peak_mode_patched.R`).
++#
++# (d) TODO (low priority): submit the patch upstream to
++#     yezhengSTAT/ADTnorm and remove this file once a release containing
++#     it lands on CRAN/Bioconductor.
++#
++# License: GPL-3 (inherited from ADTnorm; see ADTnorm-main/LICENSE.md).
++# Original author: Ye Zheng <yzheng23@fredhutch.org>.
++###############################################################################
++
++.get_peak_mode_patched = function(cell_x_adt = NULL, cell_x_feature = NULL, adt_marker_select = NULL, adt_marker_index = NULL, bwFac_smallest = 1.1, bimodal_marker_index = NULL, trimodal_marker_index = NULL, positive_peak = NULL, neg_candidate_thres = asinh(10/5 + 1), lower_peak_thres = 0.001, arcsinh_transform_flag = TRUE) {
+ 
+     ## set parameters
+     bwFac = 1.2
+@@ -123,7 +147,7 @@
+                     }
+                     peak_ind = peak_info$peaks[, "y"] > lower_peak_thres
+                     res = peak_info$peaks[, "x"][peak_ind]
+-                    res_region = peak_info$regions[peak_ind, ]
++                    res_region = peak_info$regions[peak_ind, , drop = FALSE]
+                 # } else if(adt_marker_index %in% trimodal_marker_index){ ## trimodal marker
+                 #     fres = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest))
+                 #     peak_info = flowStats::curvPeaks(
+@@ -195,7 +219,7 @@
+                             ## more than 2 peaks, consider filtering out very low density peaks
+                             peak_ind = peak_info$peaks[, "y"] > lower_peak_thres
+                             res = peak_info$peaks[, "x"][peak_ind]
+-                            res_region = peak_info$regions[peak_ind, ]
++                            res_region = peak_info$regions[peak_ind, , drop = FALSE]
+ 
+                         } else if (zero_prop > 0.3 && length(peak_info$peaks[, "x"]) < 2) {
+                             ## less than 2 peaks and zero proportion is larger than 0.3, use finer bandwidth:fres1 instead of fres2
+@@ -224,14 +248,14 @@
+                                 if((length(peak_info$peaks[, "x"]) >= 2) && (sum(peak_info$peaks[, 'y']) > y_sum) && (peak_info$peaks[, "x"][2] - peak_info$peaks[, "x"][1] > 0.3)){
+                                     ## if using the smallest bw obtain better peak mode, switch from fres1 to fres0 results
+                                     res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+-                                    res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, ]
++                                    res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                                 }
+ 
+ 
+                             } else if (length(peak_info$peaks[, "x"]) > 2) {
+                                 ## using new bandwidth, too many peaks, consider filtering out very low density peaks
+                                 res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+-                                res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, ]
++                                res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                             } else if (length(peak_info$peaks[, "x"]) < 2) {
+                                 ## try with smallest bw to get more peak modes
+                                 fres0 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest))
+@@ -257,7 +281,7 @@
+                                 }else if (length(peak_info$peaks[, "x"]) >= 2) {
+                                     ## using new bandwidth, too many peaks, consider filtering out very low density peaks
+                                     res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+-                                    res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, ]
++                                    res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                                 }else{
+                                     ## still one peak left
+                                     res = peak_info$peaks[, "x"]
+@@ -290,17 +314,17 @@
+                                 res_region = peak_info$regions
+                             } else if (length(peak_info$peaks[, "x"]) > 2) {
+                                 res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+-                                res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, ]
++                                res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                             }
+                         } else {
+                             ## no other cases?
+                             res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+-                            res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, ]
++                            res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                         }
+                     } else {
+                         ## not in user defined marker list, can have 1 peaks. Filter very low density peaks
+                         res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+-                        res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, ]
++                        res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                     }
+                 } ## end of other marker processing
+ 
+@@ -323,7 +347,7 @@
+                         res_regionTmp = peak_infoTmp$regions
+                     } else {
+                         resTmp = peak_infoTmp$midpoints[peak_infoTmp$peaks[, "y"] > lower_peak_thres]
+-                        res_regionTmp = peak_infoTmp$regions[peak_infoTmp$peaks[, "y"] > lower_peak_thres, ]
++                        res_regionTmp = peak_infoTmp$regions[peak_infoTmp$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                     }
+ 
+                     indTmp = which(!is.na(resTmp))
+@@ -333,7 +357,7 @@
+                             as.matrix() %>%
+                             t()
+                     }
+-                    res_regionTmp = res_regionTmp[indTmp, ]
++                    res_regionTmp = res_regionTmp[indTmp, , drop = FALSE]
+                     if (length(resTmp) > 1 && (sum(resTmp < 2) < length(resTmp))) {
+                         res = resTmp
+                         res_region = res_regionTmp
+@@ -350,7 +374,7 @@
+                     for(check_item in check_index){
+                         if(peak_info$peaks[check_item, "y"] < 1 && peak_info$peak[max(check_index)+1, "y"]/peak_info$peak[check_item, "y"] > 5){
+                             res = res[-1]
+-                            res_region = res_region[-1, ]
++                            res_region = res_region[-1, , drop = FALSE]
+                         }
+                     }
+                 }
+@@ -358,7 +382,7 @@
+                 ## all the peaks around 2 and zero proportion very large. Highly likely to have only one peak.
+                 if (length(res) > 1 && zero_prop > 0.5 && (sum(res < neg_candidate_thres) == length(res))) {
+                     res = peak_info$peaks[, "x"][which(peak_info$peaks[, "y"] == max(peak_info$peak[, "y"]))]
+-                    res_region = peak_info$regions[which(peak_info$peaks[, "y"] == max(peak_info$peak[, "y"])), ]
++                    res_region = peak_info$regions[which(peak_info$peaks[, "y"] == max(peak_info$peak[, "y"])), , drop = FALSE]
+                 }
+ 
+                 ## record peak mode and peak regions

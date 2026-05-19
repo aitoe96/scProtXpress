@@ -1,0 +1,115 @@
+---
+title: "scProtXpress: CyTOF quick start"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{scProtXpress: CyTOF quick start}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE
+)
+```
+
+# Minimal CyTOF run
+
+The CyTOF entry point uses the `exprs` (arcsinh-transformed) assay of a
+`SingleCellExperiment`. `unpack_sce_cytof()` extracts the matrix and the
+`colData` data frame in the shape `run_scProteinXpress()` expects.
+
+```{r}
+library(scProtXpress)
+
+sce <- readRDS("data/cytof_reference.rds")
+unpacked <- unpack_sce_cytof(sce, assay_name = "exprs",
+                             batch_default_col = "dataset_id")
+
+run_scProteinXpress(
+  data            = unpacked$data,
+  metadata        = unpacked$metadata,
+  dir             = "results",
+  file.name       = "CyTOF_run",
+  modality        = "CyTOF",
+  cell_id_col     = "cell_id",
+  cell_type_col   = "cell_type",
+  dataset_col     = "dataset_id",
+  sample_col      = "sample_id",
+  batch_col       = "batch",
+  tissue_default  = "PBMC",
+  num.boot.sample = 1000L,
+  ncores          = 4L,
+  is_transformed  = unpacked$is_transformed
+)
+```
+
+# External query against a cached reference
+
+```{r}
+sce_q   <- readRDS("data/cytof_query.rds")
+unpacked_q <- unpack_sce_cytof(sce_q)
+
+run_scProteinXpress(
+  data           = unpacked_q$data,
+  metadata       = unpacked_q$metadata,
+  dir            = "results/Query_disease",
+  file.name      = "disease",
+  precBack       = "results/Ref_CyTOF_run",
+  modality       = "CyTOF",
+  ncores         = 4L,
+  is_transformed = unpacked_q$is_transformed
+)
+```
+
+# Activate SQS (opt-in)
+
+By default `apply_sqs = "none"` and no SQS scores are logged. To turn it
+on for the reference build only:
+
+```{r}
+run_scProteinXpress(
+  data            = unpacked$data,
+  metadata        = unpacked$metadata,
+  dir             = "results",
+  file.name       = "CyTOF_run_with_sqs",
+  modality        = "CyTOF",
+  apply_sqs       = "ref_only",
+  sqs_threshold   = 1.0,
+  num.boot.sample = 1000L,
+  ncores          = 4L,
+  is_transformed  = TRUE
+)
+```
+
+The per-marker / per-sample scores are written to
+`<Ref_dir>/<file.name>_SQS_ref_log.csv`. To generate the diagnostic
+PNG, `source()` the optional reporter:
+
+```{r}
+source(system.file("sqs/sqs_report.R", package = "scProtXpress"))
+df <- load_sqs_logs(ref_dir = "results/Ref_CyTOF_run_with_sqs")
+save_sqs_report(df, out_dir = "results/SQS_report")
+```
+
+# Cell-level outlier filter
+
+`qc_outlier_cells = "auto"` (default) leaves the scuttle filter OFF for
+CyTOF. To force it on, pass `"yes"`:
+
+```{r}
+run_scProteinXpress(
+  data             = unpacked$data,
+  metadata         = unpacked$metadata,
+  dir              = "results",
+  file.name        = "CyTOF_filtered",
+  modality         = "CyTOF",
+  qc_outlier_cells = "yes",
+  qc_nmads         = 3,
+  num.boot.sample  = 1000L,
+  ncores           = 4L,
+  is_transformed   = TRUE
+)
+```

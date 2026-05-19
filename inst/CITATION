@@ -1,0 +1,22 @@
+citHeader("To cite scProtXpress in publications, please use:")
+
+bibentry(
+  bibtype  = "Article",
+  title    = "scProtXpress: discretised single-cell protein expression for CyTOF and CITE-seq",
+  author   = personList(
+    person(given = "Andoni", family = "Perez", email = "amperez@cicbiogune.es")
+    ## [CITATION: preprint pending] add coauthors when manuscript is finalised
+  ),
+  journal  = "[CITATION: preprint pending]",
+  year     = "[CITATION: preprint pending]",
+  volume   = "[CITATION: preprint pending]",
+  number   = "[CITATION: preprint pending]",
+  pages    = "[CITATION: preprint pending]",
+  doi      = "[CITATION: preprint pending]",
+  url      = "[CITATION: preprint pending]",
+  textVersion = paste(
+    "Perez, A. et al. (year).",
+    "scProtXpress: discretised single-cell protein expression for CyTOF and CITE-seq.",
+    "[CITATION: preprint pending]."
+  )
+)

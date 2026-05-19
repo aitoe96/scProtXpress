@@ -1,0 +1,468 @@
+###############################################################################
+# get_peak_mode_patched.R
+#
+# Local patched copy of ADTnorm::get_peak_mode().
+#
+# (a) Status
+#     This file is a verbatim copy of ADTnorm/R/get_peak_mode.R from the
+#     local fork at scProt/scripts/final_code/ADTnorm-main/ (snapshot
+#     dated 2025-07-08; corresponds to the ADTnorm GitHub `main` branch
+#     at https://github.com/yezhengSTAT/ADTnorm). The function is
+#     re-exposed under an internal-only name: `.get_peak_mode_patched()`.
+#     `ADTnorm::get_peak_mode()` is NOT modified; the pipeline only ever
+#     calls `.get_peak_mode_patched()`.
+#
+# (b) Patch
+#     Twelve `[mask, ]` subsetting expressions on `peak_info$regions`,
+#     `res_region` and `res_regionTmp` collapse 1-row matrices to a
+#     length-2 numeric vector, which silently corrupts the downstream
+#     write `peak_region[[sample_name]][1:length(res), ] = res_region`
+#     when the mask selects exactly one row. Each site is patched with
+#     `, drop = FALSE`. No other changes are made.
+#
+# (c) The twelve patch sites. Each row gives (upstream line in
+#     ADTnorm-main/R/get_peak_mode.R, line in this file after header,
+#     short identifier).
+#       upstream L126 / here L149 - res_region = peak_info$regions[peak_ind, , drop = FALSE]            (trimodal)
+#       upstream L198 / here L221 - res_region = peak_info$regions[peak_ind, , drop = FALSE]            (bimodal len > 2)
+#       upstream L227 / here L250 - res_region = peak_info$regions[<mask>, , drop = FALSE]              (bimodal fres0)
+#       upstream L234 / here L257 - same shape, different scope
+#       upstream L260 / here L283 - same shape, different scope
+#       upstream L293 / here L316 - same shape, different scope
+#       upstream L298 / here L321 - same shape, different scope
+#       upstream L303 / here L326 - same shape, different scope
+#       upstream L326 / here L349 - res_regionTmp = peak_infoTmp$regions[<mask>, , drop = FALSE]
+#       upstream L336 / here L359 - res_regionTmp = res_regionTmp[indTmp, , drop = FALSE]
+#       upstream L353 / here L376 - res_region = res_region[-1, , drop = FALSE]
+#       upstream L361 / here L384 - res_region = peak_info$regions[which(<...>), , drop = FALSE]
+#
+#     For machine-readable form see `cytof_scProt/get_peak_mode.diff`
+#     (output of `diff -u ADTnorm-main/R/get_peak_mode.R
+#                          cytof_scProt/get_peak_mode_patched.R`).
+#
+# (d) TODO (low priority): submit the patch upstream to
+#     yezhengSTAT/ADTnorm and remove this file once a release containing
+#     it lands on CRAN/Bioconductor.
+#
+# License: GPL-3 (inherited from ADTnorm; see ADTnorm-main/LICENSE.md).
+# Original author: Ye Zheng <yzheng23@fredhutch.org>.
+###############################################################################
+
+#' @noRd
+.get_peak_mode_patched = function(cell_x_adt = NULL, cell_x_feature = NULL, adt_marker_select = NULL, adt_marker_index = NULL, bwFac_smallest = 1.1, bimodal_marker_index = NULL, trimodal_marker_index = NULL, positive_peak = NULL, neg_candidate_thres = asinh(10/5 + 1), lower_peak_thres = 0.001, arcsinh_transform_flag = TRUE) {
+
+    ## set parameters
+    bwFac = 1.2
+    border = 0.01
+    peakNr = NULL
+    densities = NULL
+    n = 201
+    indices = FALSE
+
+    ## get peak mode for each sample of this processing ADT marker
+    sample_name_list = levels(cell_x_feature$sample) ## user provided or auto-detected
+    ## get ADT value range with a slightly extension
+    from = min(cell_x_adt[, adt_marker_select], na.rm = TRUE) - diff(range(cell_x_adt[, adt_marker_select], na.rm = TRUE)) * 0.15
+    to = max(cell_x_adt[, adt_marker_select], na.rm = TRUE) + diff(range(cell_x_adt[, adt_marker_select], na.rm = TRUE)) * 0.15
+
+    peak_num = 0
+    peak_mode = list()
+    peak_region = list()
+    
+    bimodal_marker_index_original = bimodal_marker_index
+    for(sample_name in sample_name_list){
+        
+        bimodal_marker_index = bimodal_marker_index_original
+
+        ## extract the ADT counts for this sample
+        cell_ind_tmp = which(cell_x_feature$sample == sample_name)
+        cell_notNA = which(!is.na(cell_x_adt[cell_ind_tmp, adt_marker_select]))
+        cell_ind = cell_ind_tmp[cell_notNA]
+        if(length(cell_ind) > 0){
+            # fcs_count = cell_x_adt[cell_ind, ] %>% as.matrix()
+            # fcs = flowCore::flowFrame(fcs_count)
+            fcs_count = cell_x_adt[cell_ind, adt_marker_select, drop = FALSE] %>% as.matrix
+            colnames(fcs_count) = adt_marker_select
+            fcs = flowCore::flowFrame(fcs_count)
+
+            unique_value = length(unique(cell_x_adt[cell_ind, adt_marker_select]))
+            if(unique_value == 1){
+                    ## only one value for this marker
+                    peak_mode[[sample_name]] = NA
+                    peak_region[[sample_name]] = matrix(NA, ncol = 2, nrow = 1)
+                    print(paste0(sample_name, "-Single Value!"))
+            } else {
+                ## get the proportion of cells near zero to diagnoise the negative peak enrichment
+                if(arcsinh_transform_flag){
+                    zero_prop = sum(cell_x_adt[cell_ind, adt_marker_select] < 2) / length(cell_x_adt[cell_ind, adt_marker_select])
+                }else{
+                    zero_prop = sum(cell_x_adt[cell_ind, adt_marker_select] < neg_candidate_thres) / length(cell_x_adt[cell_ind, adt_marker_select])
+                }
+                # zero_prop_list[[sample_name]] = zero_prop ## zero proportion
+                adt_expression = cell_x_adt[cell_ind, adt_marker_select] ## adt value for this marker and this sample
+
+                ## if most are around 0 and there are very few unique value: add random small number
+                if(zero_prop >= 0.95){
+                    if(length(unique(adt_expression)) < 50){
+                        if(adt_marker_index %in% bimodal_marker_index){
+                            print(paste0("This marker only has ", length(unique(adt_expression)), " unique values and the near-zero proportion is ", zero_prop, ". It is highly likely not a bimodal marker. Excluded from 'bimodal_marker' list."))
+                            bimodal_marker_index = bimodal_marker_index[!bimodal_marker_index %in% adt_marker_index]
+                        }
+                        adt_expression = adt_expression + stats::rnorm(length(adt_expression), mean = 0, sd = 0.05)
+                        # exprs(dat[[sample_name]])[, adt_marker_select] = adt_expression
+                        
+                    }
+                }
+                fres1 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = max(2, bwFac_smallest)))
+                fres2 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = max(3, bwFac_smallest)))
+                fres3 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = max(3.1, bwFac_smallest)))
+
+                ## different bandwidth w.r.t the zero proportion.
+                if (zero_prop > 0.5) {
+                    fres = fres3
+                } else if (zero_prop > 0.3) {
+                    fres = fres2
+                } else {
+                    fres = fres1
+                }
+
+                ## processing CD4
+                if(adt_marker_index %in% trimodal_marker_index){ #if (!is.null(cd4_index) && adt_marker_index == cd4_index) {
+                    fres = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest))
+                    peak_info = flowStats::curvPeaks(
+                        x = fres,
+                        dat = adt_expression,
+                        borderQuant = border,
+                        from = from,
+                        to = to
+                    )
+                    if(length(peak_info$peaks[, "x"]) != 3){ ## if not obtain 3 peaks, better to use a larger bw
+                        fres = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest + 0.5))
+                        peak_info = flowStats::curvPeaks(
+                        x = fres,
+                        dat = adt_expression,
+                        borderQuant = border,
+                        from = from,
+                        to = to
+                        )
+                    }
+                    peak_ind = peak_info$peaks[, "y"] > lower_peak_thres
+                    res = peak_info$peaks[, "x"][peak_ind]
+                    res_region = peak_info$regions[peak_ind, , drop = FALSE]
+                # } else if(adt_marker_index %in% trimodal_marker_index){ ## trimodal marker
+                #     fres = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest))
+                #     peak_info = flowStats::curvPeaks(
+                #         x = fres,
+                #         dat = adt_expression,
+                #         borderQuant = border,
+                #         from = from,
+                #         to = to
+                #     )
+                #     if(length(peak_info$peaks[, "x"]) != 3){ ## if not obtain 3 peaks, better to use a larger bw
+                #         fres = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest + 0.5))
+                #         peak_info = flowStats::curvPeaks(
+                #         x = fres,
+                #         dat = adt_expression,
+                #         borderQuant = border,
+                #         from = from,
+                #         to = to
+                #         )
+                #     }
+                #     res = peak_info$peaks[, "x"]
+                #     res_region = peak_info$regions
+                } else { ## other marker
+                    peak_info = flowStats::curvPeaks(
+                        x = fres,
+                        dat = adt_expression,
+                        borderQuant = border,
+                        from = from,
+                        to = to
+                    )
+                    ## if no peak is detected
+                    if(is.na(peak_info$midpoints[1])){
+                        ## try using the smallest bw
+                        fres0 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest))
+                        peak_info = flowStats::curvPeaks(
+                            x = fres0,
+                            dat = adt_expression,
+                            borderQuant = 0,
+                            from = from,
+                            to = to
+                        )
+                        ## if still no peak detected
+                        if(is.na(peak_info$midpoints[1])){
+                            adt_expression = adt_expression + stats::rnorm(length(adt_expression), mean = 0, sd = 0.05)
+                            fcs_count = adt_expression %>% t %>% t %>% as.matrix()
+                            colnames(fcs_count) = adt_marker_select
+                            fcs = flowCore::flowFrame(fcs_count)
+                            ## update fres
+                            fres1 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = 2))
+                            fres2 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = 3))
+                            fres3 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = 3.1))
+                            fres = fres3
+                            peak_info = flowStats::curvPeaks(
+                                x = fres,
+                                dat = adt_expression,
+                                borderQuant = border,
+                                from = from,
+                                to = to
+                            )
+                        }
+                    }
+
+                    ## User defined the marker that is known to usually have multiple peaks (n = 2)
+                    if (adt_marker_index %in% bimodal_marker_index) {
+                        if (length(peak_info$peaks[, "x"]) == 2) {
+                            ## 2 peaks, perfect!
+                            res = peak_info$peaks[, "x"]
+                            res_region = peak_info$regions
+                        } else if (length(peak_info$peaks[, "x"]) > 2) {
+                            ## more than 2 peaks, consider filtering out very low density peaks
+                            peak_ind = peak_info$peaks[, "y"] > lower_peak_thres
+                            res = peak_info$peaks[, "x"][peak_ind]
+                            res_region = peak_info$regions[peak_ind, , drop = FALSE]
+
+                        } else if (zero_prop > 0.3 && length(peak_info$peaks[, "x"]) < 2) {
+                            ## less than 2 peaks and zero proportion is larger than 0.3, use finer bandwidth:fres1 instead of fres2
+                            peak_info = flowStats::curvPeaks(
+                                x = fres1,
+                                dat = adt_expression,
+                                borderQuant = 0,
+                                from = from,
+                                to = to
+                            )
+                            if (length(peak_info$peaks[, "x"]) == 2) {
+                                ## peak number ==2 output results.
+                                y_sum = peak_info$peaks[, 'y'] %>% sum
+                                res = peak_info$peaks[, "x"]
+                                res_region = peak_info$regions
+
+                                fres0 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest))
+
+                                peak_info = flowStats::curvPeaks(
+                                    x = fres0,
+                                    dat = adt_expression,
+                                    borderQuant = 0,
+                                    from = from,
+                                    to = to
+                                )
+                                if((length(peak_info$peaks[, "x"]) >= 2) && (sum(peak_info$peaks[, 'y']) > y_sum) && (peak_info$peaks[, "x"][2] - peak_info$peaks[, "x"][1] > 0.3)){
+                                    ## if using the smallest bw obtain better peak mode, switch from fres1 to fres0 results
+                                    res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+                                    res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                                }
+
+
+                            } else if (length(peak_info$peaks[, "x"]) > 2) {
+                                ## using new bandwidth, too many peaks, consider filtering out very low density peaks
+                                res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+                                res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                            } else if (length(peak_info$peaks[, "x"]) < 2) {
+                                ## try with smallest bw to get more peak modes
+                                fres0 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest))
+                                peak_info = flowStats::curvPeaks(
+                                    x = fres0,
+                                    dat = adt_expression,
+                                    borderQuant = 0,
+                                    from = from,
+                                    to = to
+                                )
+                                if(any(is.na(peak_info$peaks[, "x"])) || (length(peak_info$peaks[, "x"]) >= 2 && peak_info$peaks[, "x"][2] - peak_info$peaks[, "x"][1] < 0.5)){
+
+                                    ## smallest bw may lead to NA midpoint or peaks that are too close due to discrete value
+                                    peak_info = flowStats::curvPeaks(
+                                        x = fres1,
+                                        dat =  adt_expression,
+                                        borderQuant = 0,
+                                        from = from,
+                                        to = to
+                                    )
+                                    res = peak_info$peaks[, "x"]
+                                    res_region = peak_info$regions
+                                }else if (length(peak_info$peaks[, "x"]) >= 2) {
+                                    ## using new bandwidth, too many peaks, consider filtering out very low density peaks
+                                    res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+                                    res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                                }else{
+                                    ## still one peak left
+                                    res = peak_info$peaks[, "x"]
+                                    res_region = peak_info$regions
+                                }
+                            }
+                        } else if (zero_prop <= 0.3 && length(peak_info$peaks[, "x"]) < 2) {
+                            ## less than 2 peaks and small zero proportion, user finer bandwidth: fres0 instead of fres1
+                            fres0 = flowCore::filter(fcs, flowStats::curv1Filter(adt_marker_select, bwFac = bwFac_smallest)) ## 1.5
+                            peak_info = flowStats::curvPeaks(
+                                x = fres0,
+                                dat =  adt_expression,
+                                borderQuant = 0,
+                                from = from,
+                                to = to
+                            )
+                            peak_info$peaks[, "x"] = peak_info$peaks[, "x"]
+                            if(any(is.na(peak_info$peaks[, "x"])) || (length(peak_info$peaks[, "x"]) >= 2 && peak_info$peaks[, "x"][2] - peak_info$peaks[, "x"][1] < 0.5)){
+                                    peak_info = flowStats::curvPeaks(
+                                        x = fres1,
+                                        dat =  adt_expression,
+                                        borderQuant = 0,
+                                        from = from,
+                                        to = to
+                                    )
+                                    res = peak_info$peaks[, "x"]
+                                    res_region = peak_info$regions
+                            }else if (length(peak_info$peaks[, "x"]) <= 2) {
+                                res = peak_info$peaks[, "x"]
+                                res_region = peak_info$regions
+                            } else if (length(peak_info$peaks[, "x"]) > 2) {
+                                res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+                                res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                            }
+                        } else {
+                            ## no other cases?
+                            res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+                            res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                        }
+                    } else {
+                        ## not in user defined marker list, can have 1 peaks. Filter very low density peaks
+                        res = peak_info$peaks[, "x"][peak_info$peaks[, "y"] > lower_peak_thres]
+                        res_region = peak_info$regions[peak_info$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                    }
+                } ## end of other marker processing
+
+
+                ## all the multiple peaks are around 0
+                if (length(res) > 1 && zero_prop <= 0.3 && (sum(res < neg_candidate_thres) == length(res))) {
+                    ## use broader bandwidth to merge multiple peaks around 0. Use fres2 instead fres1
+                    peak_infoTmp = flowStats::curvPeaks(
+                        x = fres2,
+                        dat =  adt_expression,
+                        borderQuant = border,
+                        from = from,
+                        to = to
+                    )
+                    # peak_infoTmp$midpoints = peak_infoTmp$peaks[, "x"]
+
+                    if ((adt_marker_select %in% bimodal_marker_index) && (length(peak_infoTmp$midpoints) == 2)) {
+                        ## if user define this marker to have 2 peaks.
+                        resTmp = peak_infoTmp$midpoints
+                        res_regionTmp = peak_infoTmp$regions
+                    } else {
+                        resTmp = peak_infoTmp$midpoints[peak_infoTmp$peaks[, "y"] > lower_peak_thres]
+                        res_regionTmp = peak_infoTmp$regions[peak_infoTmp$peaks[, "y"] > lower_peak_thres, , drop = FALSE]
+                    }
+
+                    indTmp = which(!is.na(resTmp))
+                    resTmp = resTmp[indTmp]
+                    if (is.null(nrow(res_regionTmp))) {
+                        res_regionTmp = res_regionTmp %>%
+                            as.matrix() %>%
+                            t()
+                    }
+                    res_regionTmp = res_regionTmp[indTmp, , drop = FALSE]
+                    if (length(resTmp) > 1 && (sum(resTmp < 2) < length(resTmp))) {
+                        res = resTmp
+                        res_region = res_regionTmp
+                    }
+                }
+
+                ## remove small negative peak around 0
+                if (length(res) > 1 && zero_prop < 0.3 && (sum(res < neg_candidate_thres) < length(res))) {
+                    # if (peak_info$peaks[1, "x"] < 0.9 && peak_info$peaks[1, "y"] < 1 && peak_info$peaks[2, "x"] > 2 && peak_info$peaks[2, "y"] / peak_info$peaks[1, "y"] > 5) {
+                    #     res = res[-1]
+                    #     res_region = res_region[-1, ]
+                    # }
+                    check_index = which(res < neg_candidate_thres)
+                    for(check_item in check_index){
+                        if(peak_info$peaks[check_item, "y"] < 1 && peak_info$peak[max(check_index)+1, "y"]/peak_info$peak[check_item, "y"] > 5){
+                            res = res[-1]
+                            res_region = res_region[-1, , drop = FALSE]
+                        }
+                    }
+                }
+
+                ## all the peaks around 2 and zero proportion very large. Highly likely to have only one peak.
+                if (length(res) > 1 && zero_prop > 0.5 && (sum(res < neg_candidate_thres) == length(res))) {
+                    res = peak_info$peaks[, "x"][which(peak_info$peaks[, "y"] == max(peak_info$peak[, "y"]))]
+                    res_region = peak_info$regions[which(peak_info$peaks[, "y"] == max(peak_info$peak[, "y"])), , drop = FALSE]
+                }
+
+                ## record peak mode and peak regions
+                peak_num = max(peak_num, length(res))
+                peak_mode[[sample_name]] = res
+                peak_region[[sample_name]] = matrix(NA, ncol = 2, nrow = length(res))
+                peak_region[[sample_name]][1:length(res), ] = res_region
+
+            }
+
+        }else{
+            peak_mode[[sample_name]] = NA
+            peak_region[[sample_name]] = NA
+
+        }
+
+    } ## end of for loop for sample_name in sample_name_list
+
+    ## initiate landmark to record peak mode location
+    landmark = matrix(NA, ncol = peak_num, nrow = length(sample_name_list))
+    landmarkRegion = list()
+    for (i in 1:peak_num) {
+        landmarkRegion[[i]] = matrix(NA, ncol = 2, nrow = length(sample_name_list))
+        rownames(landmarkRegion[[i]]) = sample_name_list
+    }
+    rownames(landmark) = sample_name_list
+    for (i in names(peak_mode)) { ## go through samples
+        if (!is.na(peak_mode[[i]][1])) { ## if the peak modes are detected
+            peak_modeNum = length(peak_mode[[i]])
+
+            if (peak_modeNum == 1) {
+
+                ## check if the only peak should be positive peak
+                pos_marker_index = which(paste0("tmpName", positive_peak$ADT_index) == adt_marker_select)
+                pos_sample_index = which(positive_peak$sample == i)
+
+                if (length(intersect(pos_marker_index, pos_sample_index)) > 0) {
+                    landmark[i, min(2, peak_num)] = peak_mode[[i]]
+                    landmarkRegion[[min(2, peak_num)]][i, ] = peak_region[[i]]
+                } else {
+                    landmark[i, 1] = peak_mode[[i]]
+                    landmarkRegion[[1]][i, ] = peak_region[[i]]
+                }
+            } else if (peak_modeNum == 2) {
+                landmark[i, c(1, max(2, peak_num))] = peak_mode[[i]]
+
+                landmarkRegion[[1]][i, ] = peak_region[[i]][1, ]
+                landmarkRegion[[max(2, peak_num)]][i, ] = peak_region[[i]][2, ]
+            } else if (peak_modeNum == 3) {
+                landmark[i, c(1, 2, max(3, peak_num))] = peak_mode[[i]]
+                landmarkRegion[[1]][i, ] = peak_region[[i]][1, ]
+                landmarkRegion[[2]][i, ] = peak_region[[i]][2, ]
+                landmarkRegion[[max(3, peak_num)]][i, ] = peak_region[[i]][3, ]
+            } else {
+                landmark[i, 1:peak_modeNum] = peak_mode[[i]]
+                for (k in 1:peak_modeNum) {
+                    landmarkRegion[[k]][i, ] = peak_region[[i]][k, ]
+                }
+            }
+        }
+    }
+
+    ## if all the peaks are within 1 - highly likely that there is only one negative peak
+    if (max(landmark[!is.na(landmark)]) < neg_candidate_thres) {
+        landmark_new = matrix(NA, ncol = 1, nrow = nrow(landmark))
+        landmarkAllMedian = stats::median(landmark[!is.na(landmark)])
+        for (i in 1:nrow(landmark)) {
+            landmark_nonNA = landmark[i, !is.na(landmark[i, ])]
+            if (length(landmark_nonNA) > 0) {
+                landmark_new[i, ] = landmark[i, which.min(abs(landmark_nonNA - landmarkAllMedian))]
+            } else {
+                landmark_new[i, ] = NA
+            }
+        }
+        landmark = landmark_new
+    }
+    rownames(landmark) = sample_name_list
+
+
+    return(landmark)
+}
+

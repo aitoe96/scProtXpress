@@ -1,0 +1,92 @@
+---
+title: "scProtXpress: CITE-seq quick start"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{scProtXpress: CITE-seq quick start}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE
+)
+```
+
+# Minimal CITE-seq run
+
+The CITE-seq path expects a list `{$counts, $cell_x_feature}` (sparse
+dgCMatrix + metadata data.frame). `unpack_list_citeseq()` returns the
+canonical shape.
+
+```{r}
+library(scProtXpress)
+
+ref_obj  <- readRDS("data/citeseq_reference.rds")
+unpacked <- unpack_list_citeseq(ref_obj)
+
+run_scProteinXpress(
+  data             = unpacked$data,
+  metadata         = unpacked$metadata,
+  dir              = "results_citeseq",
+  file.name        = "CITEseq_run",
+  modality         = "CITE-seq",
+  cell_id_col      = "cell.id",
+  cell_type_col    = "cell.type_harmonised",
+  dataset_col      = "dataset",
+  sample_col       = "sample",
+  batch_col        = "batch",
+  tissue_default   = "PBMC",
+  num.boot.sample  = 1000L,
+  num.cells.sample = 100L,
+  ncores           = 4L,
+  is_transformed   = unpacked$is_transformed,   # NULL => autodetect
+  qc_outlier_cells = "auto"                     # CITE-seq => scuttle on
+)
+```
+
+# External query against a cached reference
+
+```{r}
+qobj       <- readRDS("data/citeseq_query.rds")
+unpacked_q <- unpack_list_citeseq(qobj)
+
+run_scProteinXpress(
+  data             = unpacked_q$data,
+  metadata         = unpacked_q$metadata,
+  dir              = "results_citeseq/Query_disease",
+  file.name        = "disease",
+  precBack         = "results_citeseq/Ref_CITEseq_run",
+  modality         = "CITE-seq",
+  cell_id_col      = "cell.id",
+  cell_type_col    = "cell.type_harmonised",
+  dataset_col      = "dataset",
+  sample_col       = "sample",
+  batch_col        = "batch",
+  ncores           = 4L,
+  is_transformed   = unpacked_q$is_transformed,
+  qc_outlier_cells = "auto"
+)
+```
+
+# `qc_outlier_cells` resolution
+
+The "auto" default reproduces the historical CITE-seq cell-outlier
+filter (scuttle::isOutlier on log10 total and detected). Set
+`"no"` to skip it (e.g., when running CITE-seq data that was already
+filtered upstream); `"yes"` to force it on regardless of modality.
+
+```{r}
+run_scProteinXpress(
+  data             = unpacked$data,
+  metadata         = unpacked$metadata,
+  dir              = "results_citeseq",
+  file.name        = "CITEseq_no_filter",
+  modality         = "CITE-seq",
+  qc_outlier_cells = "no",   # skip scuttle
+  num.boot.sample  = 1000L,
+  ncores           = 4L
+)
+```

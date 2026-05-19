@@ -1,0 +1,2817 @@
+###############################################################################
+# internalFunctions.R -- scProtXpress
+#
+# ADTnorm-based protein normalisation backend shared by both modalities.
+#
+# Behaviour (preserved from the pre-package CyTOF reference implementation):
+#   * .ADTprot_norm_ref  : per-marker foreach %dopar% (fork/PSOCK + BLAS pin).
+#   * .ADTprot_norm_query: per-marker foreach %dopar% (fork/PSOCK + BLAS pin).
+#   * RunBootstrap       : one-shot precompute + .RunBackComputations_fast
+#                          inside foreach %dopar% (cell.type x tissue strata).
+#   * resolve_ncores honours SLURM_CPUS_PER_TASK.
+#   * Mode C P2 global QC with audit CSV (cleanData_ADT).
+#   * Mode C P3 binomial sig_frame (Create.sig.frame + discrete.expr.levels).
+#   * Self-query persistence (P1) handled by run_scProteinXpress().
+###############################################################################
+
+#' @import foreach
+#' @importFrom Matrix Matrix
+#' @importFrom stats density ecdf median optimize p.adjust pbinom quantile sd var rnorm setNames
+#' @importFrom utils head read.csv read.delim write.csv write.table
+NULL
+
+if (!requireNamespace("tictoc", quietly = TRUE)) {
+  tictoc <- list(tic = function(...) invisible(NULL), toc = function(...) invisible(NULL))
+}
+
+`%dopar%` <- foreach::`%dopar%`
+`%do%`    <- foreach::`%do%`
+
+# -----------------------------------------------------------------------------
+# SQS (Stain Quality Score) - static helpers
+# Devuelven 0 si faltan datos o la varianza es cero; nunca error fatal.
+# -----------------------------------------------------------------------------
+.sqs_area_under_curve <- function(densityObj, threshold, peak_num){
+  if (is.null(densityObj) || !is.finite(threshold)) return(0)
+  if (peak_num > 1) {
+    index <- which(densityObj$x >= threshold)
+    if (length(index) == 0) return(0)
+    auc <- sum(densityObj$y[index] * diff(c(densityObj$x[index], max(densityObj$x))))
+    if (!is.finite(auc)) return(0)
+    return(auc)
+  } else {
+    index <- which(densityObj$x >= threshold)
+    if (length(index) == 0) return(0)
+    auc <- sum(densityObj$y[index] * diff(c(densityObj$x[index], max(densityObj$x))))
+    if (!is.finite(auc)) return(0)
+    return(min(auc, 1 - auc))
+  }
+}
+
+.sqs_valley_deep_scaler <- function(adt_tmp, peak_row, valley_row, adjust = 3, peak_num = NA){
+  if (length(adt_tmp) < 2) return(0)
+  adt_tmp <- adt_tmp[is.finite(adt_tmp)]
+  if (length(adt_tmp) < 2 || stats::var(adt_tmp) <= 0) return(0)
+  density_res <- tryCatch(stats::density(adt_tmp, adjust = adjust, na.rm = TRUE),
+                          error = function(e) NULL)
+  if (is.null(density_res)) return(0)
+  x <- density_res$x; y <- density_res$y
+  if (peak_num > 1) {
+    peak_last <- peak_row[length(peak_row)]
+    if (!is.finite(peak_last)) return(0)
+    x_peakR <- which(abs(x - peak_last) == min(abs(x - peak_last)))[1]
+    y_peakR <- y[x_peakR]
+  } else {
+    y_peakR <- 0
+  }
+  if (peak_num <= 2) {
+    v_ref <- valley_row[1]
+  } else {
+    v_ref <- valley_row[length(valley_row)]
+  }
+  if (!is.finite(v_ref)) return(0)
+  x_valley <- which(abs(x - v_ref) == min(abs(x - v_ref)))[1]
+  y_valley <- y[x_valley]
+  auc_scaler <- .sqs_area_under_curve(density_res, threshold = valley_row[1], peak_num = peak_num)
+  deep_scaler <- (1 + y_peakR - y_valley) * (1 + auc_scaler)
+  if (!is.finite(deep_scaler)) return(0)
+  deep_scaler
+}
+
+.sqs_two_peak <- function(adt_tmp, peak_row, valley_row, peak_num = 2){
+  adt_tmp <- adt_tmp[is.finite(adt_tmp)]
+  if (length(adt_tmp) < 2) return(0)
+  peak_first <- peak_row[1]; peak_last <- peak_row[length(peak_row)]
+  v1 <- valley_row[1]
+  if (!all(is.finite(c(peak_first, peak_last, v1)))) return(0)
+  mean_diff <- peak_last - peak_first
+  left_idx  <- which(adt_tmp < v1)
+  right_idx <- which(adt_tmp > v1)
+  ss <- 0
+  if (length(left_idx)  > 0) ss <- ss + sum((adt_tmp[left_idx]  - peak_first)^2)
+  if (length(right_idx) > 0) ss <- ss + sum((adt_tmp[right_idx] - peak_last )^2)
+  within_peak_sd <- sqrt(ss / length(adt_tmp))
+  if (!is.finite(within_peak_sd) || within_peak_sd <= 0) return(0)
+  deep_scaler <- .sqs_valley_deep_scaler(adt_tmp, peak_row, valley_row, peak_num = peak_num)
+  score <- (mean_diff * deep_scaler) / within_peak_sd
+  if (!is.finite(score)) return(0)
+  score
+}
+
+.sqs_multi_peak <- function(adt_tmp, peak_row, valley_row, peak_num = 3){
+  adt_tmp <- adt_tmp[is.finite(adt_tmp)]
+  if (length(adt_tmp) < 2) return(0)
+  peak_first <- peak_row[1]; peak_last <- peak_row[length(peak_row)]
+  if (!all(is.finite(c(peak_first, peak_last)))) return(0)
+  mean_diff <- peak_last - peak_first
+  within_peak_var <- 0
+  ncols <- length(peak_row)
+  for (col_index in seq_len(ncols)) {
+    pk <- peak_row[col_index]
+    if (!is.finite(pk)) next
+    if (col_index == 1) {
+      v_right <- valley_row[col_index]
+      if (!is.finite(v_right)) next
+      sel <- which(adt_tmp < v_right)
+    } else if (col_index == ncols) {
+      v_left <- valley_row[col_index - 1]
+      if (!is.finite(v_left)) next
+      sel <- which(adt_tmp > v_left)
+    } else {
+      v_left <- valley_row[col_index - 1]; v_right <- valley_row[col_index]
+      if (!is.finite(v_left) || !is.finite(v_right)) next
+      sel <- which(adt_tmp < v_right & adt_tmp > v_left)
+    }
+    if (length(sel) > 0) within_peak_var <- within_peak_var + sum((adt_tmp[sel] - pk)^2)
+  }
+  within_peak_sd <- sqrt(within_peak_var / length(adt_tmp))
+  if (!is.finite(within_peak_sd) || within_peak_sd <= 0) return(0)
+  deep_scaler <- .sqs_valley_deep_scaler(adt_tmp, peak_row, valley_row, peak_num = peak_num)
+  score <- (mean_diff * deep_scaler) / within_peak_sd
+  if (!is.finite(score)) return(0)
+  score
+}
+
+.sqs_one_peak <- function(adt_tmp, peak_row, valley_row, peak_num = 1){
+  adt_tmp <- adt_tmp[is.finite(adt_tmp)]
+  if (length(adt_tmp) < 2) return(0)
+  v1 <- valley_row[1]
+  if (!is.finite(v1)) return(0)
+  ncols <- length(peak_row)
+  if (ncols == 1) {
+    p_ref <- peak_row[1]
+  } else if (is.na(peak_row[1])) {
+    p_ref <- peak_row[ncols]
+  } else {
+    p_ref <- peak_row[1]
+  }
+  if (!is.finite(p_ref)) return(0)
+  mean_diff <- abs(v1 - p_ref)
+  sd_val <- stats::sd(adt_tmp)
+  if (!is.finite(sd_val) || sd_val <= 0) return(0)
+  within_peak_sd <- sqrt(sd_val)
+  if (!is.finite(within_peak_sd) || within_peak_sd <= 0) return(0)
+  deep_scaler <- .sqs_valley_deep_scaler(adt_tmp, peak_row, valley_row, peak_num = peak_num)
+  score <- (mean_diff * deep_scaler) / within_peak_sd
+  if (!is.finite(score)) return(0)
+  score
+}
+
+# Dispatcher: calcula SQS por muestra para un marcador, devuelve un named numeric.
+.sqs_compute_per_sample <- function(marker_vec, sample_vec, valid_samples, peak_info, valley_info){
+  out <- setNames(rep(0, length(valid_samples)), valid_samples)
+  if (is.null(peak_info) || is.null(valley_info)) return(out)
+  for (s in valid_samples) {
+    if (!(s %in% rownames(peak_info)) || !(s %in% rownames(valley_info))) { out[s] <- 0; next }
+    peak_row   <- peak_info[s, ]
+    valley_row <- valley_info[s, ]
+    peak_num   <- sum(!is.na(peak_row))
+    idx_s <- which(sample_vec == s)
+    if (length(idx_s) == 0) { out[s] <- 0; next }
+    adt_tmp <- marker_vec[idx_s]
+    if (peak_num <= 0) { out[s] <- 0; next }
+    score <- tryCatch({
+      if (peak_num == 1) {
+        .sqs_one_peak(adt_tmp, peak_row, valley_row, peak_num = peak_num)
+      } else if (peak_num == 2) {
+        .sqs_two_peak(adt_tmp, peak_row, valley_row, peak_num = peak_num)
+      } else {
+        .sqs_multi_peak(adt_tmp, peak_row, valley_row, peak_num = peak_num)
+      }
+    }, error = function(e) 0)
+    if (!is.finite(score)) score <- 0
+    out[s] <- score
+  }
+  out
+}
+
+# Append-only CSV logger (sin dependencias; thread-unsafe pero uso secuencial).
+.sqs_log_append <- function(log_path, df_row){
+  if (is.null(log_path) || !nzchar(log_path)) return(invisible(NULL))
+  dir.create(dirname(log_path), recursive = TRUE, showWarnings = FALSE)
+  write_header <- !file.exists(log_path)
+  utils::write.table(df_row, file = log_path, sep = ",",
+                     row.names = FALSE, col.names = write_header,
+                     append = !write_header, quote = FALSE)
+  invisible(NULL)
+}
+
+# Internal timestamped logger (T-6, unification).
+# Returns invisibly so it can be embedded in pipelines without affecting the
+# return values of the wrapping block. The format is ISO-8601 down to the
+# second to allow log greps and downstream parsing.
+#
+# Intentionally NOT a replacement for the existing message()/cat() calls in
+# this file: those keep their wording and order verbatim per the rules of
+# Hito 2 ("No cambias la lógica numérica" and the unwritten "no churn"
+# corollary on log lines). `.log_step()` is opt-in scaffolding for new
+# instrumentation only.
+.log_step <- function(label, ..., level = c("info", "warn"), .stream = stderr()) {
+  level <- match.arg(level)
+  ts <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S")
+  msg <- sprintf("[%s][%s] %s", ts, toupper(level),
+                 paste0(c(label, ...), collapse = " "))
+  if (identical(level, "warn")) {
+    warning(msg, call. = FALSE)
+  } else {
+    message(msg)
+  }
+  invisible(msg)
+}
+
+# -----------------------------------------------------------------------------
+# Modality dispatch helpers (T-1, unification).
+#
+# `.ingest_<modality>()` is invoked from run_scProteinXpress() at the very
+# top of the pipeline. Its sole responsibility is to coerce `data` into the
+# storage backend that the rest of the pipeline expects for that modality,
+# and to return `metadata` as a base data.frame. Both helpers leave
+# metadata column translation and validation to run_scProteinXpress().
+#
+#   CyTOF    : dense base::matrix (panels are small; arcsinh values dense).
+#   CITE-seq : sparse dgCMatrix   (panels can be large + raw ADT counts are
+#              sparse with many zeros; preserving sparsity matters for RAM).
+#
+# Downstream helpers (`.as_dense_matrix`, `make_ADTnorm_input`,
+# `cleanData_ADT`) accept both backends because `.as_dense_matrix()`
+# already handles `Matrix` objects via `as.matrix()`.
+# -----------------------------------------------------------------------------
+.ingest_cytof <- function(data, metadata) {
+  if (is.data.frame(data)) data <- as.matrix(data)
+  if (inherits(data, "Matrix")) data <- as.matrix(data)
+  if (!is.matrix(data)) {
+    stop(".ingest_cytof: data must be matrix, Matrix, or data.frame; got ",
+         paste(class(data), collapse = ","))
+  }
+  storage.mode(data) <- "double"
+  list(data = data, metadata = as.data.frame(metadata, stringsAsFactors = FALSE))
+}
+
+.ingest_citeseq <- function(data, metadata) {
+  if (is.data.frame(data)) data <- as.matrix(data)
+  if (is.matrix(data)) {
+    data <- as(Matrix::Matrix(data, sparse = TRUE), "dgCMatrix")
+  } else if (inherits(data, "Matrix") && !inherits(data, "dgCMatrix")) {
+    data <- as(data, "dgCMatrix")
+  }
+  if (!inherits(data, "dgCMatrix")) {
+    stop(".ingest_citeseq: data must be matrix, Matrix, dgCMatrix, or data.frame; got ",
+         paste(class(data), collapse = ","))
+  }
+  list(data = data, metadata = as.data.frame(metadata, stringsAsFactors = FALSE))
+}
+
+# `.resolve_meta_col()` standardises metadata column resolution (A1):
+# - Tries `primary` first; then each entry in `fallbacks` in order.
+# - First column found is renamed in place to `internal_name`.
+# - If none match: either fall back to a constant (`fallback_value`),
+#   to another already-existing column (`fallback_from`), or stop().
+.resolve_meta_col <- function(metadata, primary, fallbacks, internal_name,
+                              fallback_value = NA, fallback_from = NULL) {
+  candidates <- unique(c(primary, fallbacks))
+  hit <- candidates[candidates %in% colnames(metadata)][1]
+  if (!is.na(hit) && length(hit) == 1L) {
+    if (hit != internal_name) {
+      ## If `internal_name` already exists too, drop it before renaming so we
+      ## do not create duplicated colnames.
+      if (internal_name %in% colnames(metadata)) {
+        metadata[[internal_name]] <- NULL
+      }
+      colnames(metadata)[colnames(metadata) == hit] <- internal_name
+    }
+    return(metadata)
+  }
+  if (!is.null(fallback_from) && fallback_from %in% colnames(metadata)) {
+    metadata[[internal_name]] <- metadata[[fallback_from]]
+    return(metadata)
+  }
+  if (!isTRUE(is.na(fallback_value))) {
+    metadata[[internal_name]] <- fallback_value
+    return(metadata)
+  }
+  stop(sprintf(
+    "metadata: could not resolve column for '%s'. Tried: %s",
+    internal_name, paste(candidates, collapse = ", ")))
+}
+
+# --- Helpers ---
+.as_dense_matrix <- function(x) {
+  if (is.matrix(x)) return(x)
+  if (inherits(x, "Matrix")) return(as.matrix(x))
+  if (is.data.frame(x)) return(as.matrix(x))
+  stop("Cannot coerce object to dense matrix", call. = FALSE)
+}
+
+.pad_to_features <- function(mat, feats) {
+  mat <- .as_dense_matrix(mat)
+  miss <- setdiff(feats, rownames(mat))
+  if (length(miss) > 0) {
+    zero <- matrix(NA_real_, nrow = length(miss), ncol = ncol(mat))
+    rownames(zero) <- miss
+    colnames(zero) <- colnames(mat)
+    mat <- rbind(mat, zero)
+  }
+  mat <- mat[feats, , drop = FALSE]
+  .as_dense_matrix(mat)
+}
+
+.safe_to_matrix <- function(res, rnames) {
+  if (is.null(res)) return(matrix(NA_real_, nrow=length(rnames), ncol=1, dimnames=list(rnames, NULL)))
+  if (is.data.frame(res)) res <- as.matrix(res)
+  if (!is.matrix(res)) res <- matrix(res, nrow = length(rnames), byrow = TRUE)
+  rownames(res) <- rnames
+  res
+}
+
+make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batch_col = "batch") {
+  counts_fxC <- .as_dense_matrix(counts_fxC)
+  metadata <- as.data.frame(metadata)
+  common.cells <- intersect(colnames(counts_fxC), rownames(metadata))
+  counts_fxC <- counts_fxC[, common.cells, drop = FALSE]
+  metadata <- metadata[common.cells, , drop = FALSE]
+  
+  cell_x_adt <- t(counts_fxC)
+  cell_x_feature <- metadata
+  cell_x_feature$sample <- as.character(cell_x_feature[[sample_col]])
+  
+  if (batch_col %in% colnames(cell_x_feature)) {
+    cell_x_feature$batch <- as.character(cell_x_feature[[batch_col]])
+  } else {
+    cell_x_feature$batch <- cell_x_feature$sample
+  }
+  
+  if (!is.factor(cell_x_feature$sample)) cell_x_feature$sample <- factor(cell_x_feature$sample, levels = unique(cell_x_feature$sample))
+  cell_x_feature <- cell_x_feature[rownames(cell_x_adt), , drop = FALSE]
+  list(cell_x_adt = cell_x_adt, cell_x_feature = cell_x_feature)
+}
+
+## .detect_input_mode() -- three-valued is_transformed semantics (T-2).
+##
+##   is_transformed = NULL   (default)
+##     "decide for me": run the integer-coercibility heuristic. Treat the
+##     matrix as already transformed iff at least one usable value differs
+##     from its integer cast (i.e. there is a non-integer real value).
+##
+##   is_transformed = TRUE
+##     "force: already transformed". Skip arcsinh regardless of values.
+##
+##   is_transformed = FALSE
+##     "force: NOT transformed". Always apply arcsinh. This bypasses the
+##     heuristic, so callers that *know* the matrix is raw can override
+##     ADTnorm's auto-detection of non-integer noise.
+##
+## Returns:
+##   list(arcsinh_transform_flag, neg_candidate_thres)
+##
+## Note on backwards compatibility: the pre-unification API treated FALSE
+## as "autodetect" because the heuristic ran via `is_transformed || any(...)`.
+## With the new semantics, FALSE means force-apply. The CyTOF driver
+## passes `is_transformed = TRUE` explicitly for the arcsinh-transformed
+## "exprs" assay; it is unaffected. Drivers that previously omitted the
+## argument (CITE-seq `codebase/run_scProteinXpress.R`) now get NULL via
+## the unified API, which preserves the prior autodetect behaviour.
+.detect_input_mode <- function(cell_x_adt, neg_candidate_thres = NULL,
+                               is_transformed = NULL, verbose = TRUE) {
+  matrix_in <- as.matrix(cell_x_adt)
+
+  if (is.null(is_transformed)) {
+    as_int <- matrix_in
+    mode(as_int) <- "integer"
+    is_already_transformed <- any(
+      as_int[!is.na(as_int)] != matrix_in[!is.na(matrix_in)],
+      na.rm = TRUE
+    )
+  } else if (isTRUE(is_transformed)) {
+    is_already_transformed <- TRUE
+  } else if (isFALSE(is_transformed)) {
+    is_already_transformed <- FALSE
+  } else {
+    stop(".detect_input_mode: is_transformed must be NULL, TRUE, or FALSE.")
+  }
+
+  if (is_already_transformed) {
+    arcsinh_transform_flag <- FALSE
+    if (is.null(neg_candidate_thres)) {
+      neg_candidate_thres <- asinh(1/5 + 1)
+    }
+  } else {
+    if (any(matrix_in[!is.na(matrix_in)] < 0)) {
+      warning("ADTnorm detects integer input ADT count matrix and assumes the input is raw count. Please check why there is any negative values in the raw count matrix.")
+    }
+    arcsinh_transform_flag <- TRUE
+    if (is.null(neg_candidate_thres)) neg_candidate_thres <- asinh(4/5 + 1)
+  }
+  list(arcsinh_transform_flag = arcsinh_transform_flag,
+       neg_candidate_thres    = neg_candidate_thres)
+}
+
+.build_target_landmark <- function(target_landmark_location, landmark_align_type, peak_mode_res){
+  if (is.null(target_landmark_location)) return(NULL)
+  if (length(target_landmark_location) == 1 && identical(target_landmark_location, "fixed")) target_landmark_location <- c(1, 5)
+  if (landmark_align_type == "negPeak_valley_posPeak") {
+    if (ncol(peak_mode_res) == 1) return(c(target_landmark_location[1], round(mean(target_landmark_location), 1)))
+    else if (ncol(peak_mode_res) == 2) return(c(target_landmark_location[1], round(mean(target_landmark_location), 1), target_landmark_location[2]))
+    else return(c(target_landmark_location[1], (target_landmark_location[1] + round(mean(target_landmark_location), 1)) / 2, target_landmark_location[2]))
+  }
+  return(NULL)
+}
+
+.coerce_peak_mode_to_reference <- function(peak_mode_res, ref_n) {
+  if (is.null(dim(peak_mode_res))) peak_mode_res <- matrix(peak_mode_res, nrow = length(peak_mode_res))
+  if (ref_n == 2) peak_mode_res <- peak_mode_res[, 1, drop = FALSE]
+  if (ref_n == 3) {
+    if (ncol(peak_mode_res) == 1) peak_mode_res <- cbind(peak_mode_res, matrix(NA, nrow = nrow(peak_mode_res), ncol = 1))
+    else if (ncol(peak_mode_res) > 2) peak_mode_res <- peak_mode_res[, c(1, ncol(peak_mode_res)), drop = FALSE]
+  }
+  peak_mode_res
+}
+
+.coerce_landmark_matrix_to_reference <- function(landmark_matrix, fixed_target_landmark, neg_candidate_thres = NULL){
+  if (is.null(dim(landmark_matrix))) landmark_matrix <- matrix(landmark_matrix, nrow = length(landmark_matrix))
+  ref_n <- length(fixed_target_landmark)
+  if (ncol(landmark_matrix) < ref_n) landmark_matrix <- cbind(landmark_matrix, matrix(NA, nrow = nrow(landmark_matrix), ncol = ref_n - ncol(landmark_matrix)))
+  else if (ncol(landmark_matrix) > ref_n) landmark_matrix <- landmark_matrix[, seq_len(ref_n), drop = FALSE]
+  
+  for (j in seq_len(ncol(landmark_matrix))) {
+    idx_na <- is.na(landmark_matrix[, j])
+    if (any(idx_na)) {
+      col_non_na <- landmark_matrix[!idx_na, j]
+      fill_val <- if (length(col_non_na) > 0) stats::median(col_non_na, na.rm = TRUE) else fixed_target_landmark[min(j, length(fixed_target_landmark))]
+      landmark_matrix[idx_na, j] <- fill_val
+    }
+  }
+  if (ncol(landmark_matrix) >= 2) {
+    bad <- landmark_matrix[, 2] <= landmark_matrix[, 1]
+    landmark_matrix[bad, 2] <- landmark_matrix[bad, 1] + 1e-3
+  }
+  landmark_matrix
+}
+
+.extract_align_field <- function(align_res, field, fallback = NULL, pos = NULL) {
+  if (is.list(align_res) && field %in% names(align_res)) return(align_res[[field]])
+  if (!is.null(pos) && length(align_res) >= pos) return(align_res[[pos]])
+  fallback
+}
+
+# -----------------------------------------------------------------------------
+# .run_one_marker_ref  
+# -----------------------------------------------------------------------------
+.run_one_marker_ref <- function(
+    adt_marker_index,
+    cell_x_adt,
+    cell_x_feature,
+    original_marker_name,
+    quantile_clip,
+    bw_smallest_bi,
+    bw_smallest_tri,
+    bw_smallest_adjustments,
+    bimodal_marker_index,
+    trimodal_marker_index,
+    positive_peak,
+    peak_type,
+    neg_candidate_thres,
+    lower_peak_thres,
+    arcsinh_transform_flag,
+    shoulder_valley,
+    multi_sample_per_batch,
+    valley_density_adjust,
+    shoulder_valley_slope,
+    detect_outlier_valley,
+    sqs_threshold,
+    apply_sqs,
+    file.id,
+    landmark_align_type,
+    midpoint_type,
+    target_landmark_location
+){
+  adt_marker_select      <- colnames(cell_x_adt)[adt_marker_index]      
+  adt_marker_select_name <- original_marker_name[adt_marker_index]      
+  
+  out_skip_pre_sqs <- list(
+    marker_name       = adt_marker_select_name,
+    tmp_name          = adt_marker_select,
+    norm_col_override = NULL,
+    pars              = NULL,
+    sqs_rows          = list()
+  )
+  
+  if (quantile_clip < 1) {
+    quant <- stats::quantile(cell_x_adt[, adt_marker_select], quantile_clip, na.rm = TRUE)
+    clip_idx <- !is.na(cell_x_adt[, adt_marker_select]) & (cell_x_adt[, adt_marker_select] > quant)
+    cell_x_adt[clip_idx, adt_marker_select] <- NA
+  }
+  
+  valid_samples <- c()
+  for (s in levels(cell_x_feature$sample)) {
+    vals <- cell_x_adt[cell_x_feature$sample == s, adt_marker_select]
+    valid_vals <- vals[is.finite(vals)]
+    if (length(valid_vals) >= 5 && length(unique(valid_vals)) >= 3 && stats::var(valid_vals) > 1e-6) {
+      valid_samples <- c(valid_samples, s)
+    }
+  }
+  if (length(valid_samples) == 0) return(out_skip_pre_sqs)
+  
+  valid_idx <- cell_x_feature$sample %in% valid_samples
+  cell_x_adt_sub     <- cell_x_adt[valid_idx, , drop = FALSE]
+  cell_x_feature_sub <- cell_x_feature[valid_idx, , drop = FALSE]
+  cell_x_feature_sub$sample <- factor(cell_x_feature_sub$sample, levels = valid_samples)
+  
+  bwFac_smallest <- bw_smallest_bi
+  
+  peak_mode_res <- tryCatch({
+    if (peak_type == "mode") {
+      .get_peak_mode_patched(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index,
+                    bwFac_smallest, bimodal_marker_index, trimodal_marker_index, positive_peak,
+                    neg_candidate_thres, lower_peak_thres, arcsinh_transform_flag)
+    } else {
+      ADTnorm::get_peak_midpoint(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index,
+                        bwFac_smallest, bimodal_marker_index, trimodal_marker_index, positive_peak,
+                        neg_candidate_thres, lower_peak_thres, arcsinh_transform_flag)
+    }
+  }, error = function(e) {
+    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name,
+                   ": Peak detection failed -> ", conditionMessage(e)))
+    NULL
+  })
+  if (is.null(peak_mode_res)) return(out_skip_pre_sqs)
+  
+  peak_valley_list <- tryCatch({
+    ADTnorm::get_valley_location(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, peak_mode_res,
+                        shoulder_valley, positive_peak, multi_sample_per_batch,
+                        valley_density_adjust, 20, shoulder_valley_slope,
+                        neg_candidate_thres, arcsinh_transform_flag)
+  }, error = function(e) {
+    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name, ": ",
+                   conditionMessage(e)))
+    NULL
+  })
+  if (is.null(peak_valley_list)) return(out_skip_pre_sqs)
+  
+  valley_location_res <- peak_valley_list$valley_location_list
+  peak_landmark_list  <- peak_valley_list$peak_landmark_list
+  
+  if (detect_outlier_valley != FALSE) {
+    valley_location_res <- tryCatch({
+      ADTnorm::detect_impute_outlier_valley(valley_location_res, adt_marker_select, cell_x_adt_sub,
+                                   cell_x_feature_sub, 3, detect_outlier_valley, 3, 0.75)
+    }, error = function(e) valley_location_res)
+  }
+  
+  sqs_rows <- list()
+  norm_col_override <- cell_x_adt[, adt_marker_select]
+  
+  peak_info_raw   <- .safe_to_matrix(peak_landmark_list,  valid_samples)
+  valley_info_raw <- .safe_to_matrix(valley_location_res, valid_samples)
+  
+  sqs_scores <- .sqs_compute_per_sample(
+    marker_vec    = cell_x_adt_sub[, adt_marker_select],
+    sample_vec    = as.character(cell_x_feature_sub$sample),
+    valid_samples = valid_samples,
+    peak_info     = peak_info_raw,
+    valley_info   = valley_info_raw
+  )
+  
+  for (s in valid_samples) {
+    sqs_rows[[length(sqs_rows) + 1L]] <- data.frame(
+      stage      = "ref",
+      file.id    = file.id,
+      marker     = adt_marker_select_name,
+      sample     = s,
+      sqs        = unname(sqs_scores[s]),
+      threshold  = sqs_threshold,
+      apply_sqs  = apply_sqs,
+      action     = if (apply_sqs %in% c("ref_only", "both") && sqs_scores[s] < sqs_threshold) "NA" else "keep",
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  if (apply_sqs %in% c("ref_only", "both")) {
+    fail_samples <- names(sqs_scores)[sqs_scores < sqs_threshold]
+    if (length(fail_samples) > 0) {
+      fail_idx <- cell_x_feature$sample %in% fail_samples
+      norm_col_override[fail_idx] <- NA_real_
+      
+      keep_mask           <- !(valid_samples %in% fail_samples)
+      valid_samples       <- valid_samples[keep_mask]
+      peak_landmark_list  <- peak_info_raw[keep_mask, , drop = FALSE]
+      valley_location_res <- valley_info_raw[keep_mask, , drop = FALSE]
+      
+      if (length(valid_samples) == 0) {
+        return(list(
+          marker_name       = adt_marker_select_name,
+          tmp_name          = adt_marker_select,
+          norm_col_override = norm_col_override,
+          pars              = NULL,
+          sqs_rows          = sqs_rows
+        ))
+      }
+      
+      valid_idx <- cell_x_feature$sample %in% valid_samples
+      cell_x_adt_sub     <- cell_x_adt[valid_idx, , drop = FALSE]
+      cell_x_feature_sub <- cell_x_feature[valid_idx, , drop = FALSE]
+      cell_x_feature_sub$sample <- factor(cell_x_feature_sub$sample, levels = valid_samples)
+    }
+  }
+  
+  full_samples <- levels(cell_x_feature$sample)
+  peak_landmark_list <- .safe_to_matrix(peak_landmark_list, valid_samples)
+  pm_full <- matrix(NA_real_, nrow = length(full_samples), ncol = ncol(peak_landmark_list))
+  rownames(pm_full) <- full_samples
+  pm_full[valid_samples, ] <- peak_landmark_list
+  peak_mode_res_final <- pm_full
+  
+  valley_location_res <- .safe_to_matrix(valley_location_res, valid_samples)
+  vl_full <- matrix(NA_real_, nrow = length(full_samples), ncol = ncol(valley_location_res))
+  rownames(vl_full) <- full_samples
+  vl_full[valid_samples, ] <- valley_location_res
+  valley_location_res_final <- vl_full
+  
+  landmark_matrix <- tryCatch({
+    ADTnorm::landmark_fill_na(peak_mode_res_final, valley_location_res_final,
+                     landmark_align_type, midpoint_type, neg_candidate_thres)
+  }, error = function(e) {
+    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name,
+                   ": Landmark alignment failed -> ", conditionMessage(e)))
+    NULL
+  })
+  if (is.null(landmark_matrix)) {
+    return(list(
+      marker_name       = adt_marker_select_name,
+      tmp_name          = adt_marker_select,
+      norm_col_override = norm_col_override,
+      pars              = NULL,
+      sqs_rows          = sqs_rows
+    ))
+  }
+  
+  target_landmark <- .build_target_landmark(target_landmark_location,
+                                            landmark_align_type, peak_mode_res_final)
+  
+  align_res <- tryCatch({
+    ADTnorm::peak_alignment(cell_x_adt_sub[, adt_marker_select], cell_x_feature_sub,
+                   landmark_matrix[valid_samples, , drop = FALSE], target_landmark)
+  }, error = function(e) {
+    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name,
+                   ": Alignment failed -> ", conditionMessage(e)))
+    NULL
+  })
+  if (is.null(align_res)) {
+    return(list(
+      marker_name       = adt_marker_select_name,
+      tmp_name          = adt_marker_select,
+      norm_col_override = norm_col_override,
+      pars              = NULL,
+      sqs_rows          = sqs_rows
+    ))
+  }
+  
+  norm_col_override[valid_idx] <- .extract_align_field(align_res, "cell_x_adt_norm", pos = 1)
+  
+  pars <- list(
+    tmp_name              = adt_marker_select,
+    fixed_target_landmark = .extract_align_field(align_res, "target_landmark_used",
+                                                 fallback = target_landmark),
+    warp_parameters       = .extract_align_field(align_res, "warp_parameters"),
+    bwFac_smallest        = bwFac_smallest,
+    peak_type             = peak_type,
+    lower_peak_thres      = lower_peak_thres,
+    neg_candidate_thres   = neg_candidate_thres,
+    shoulder_valley       = shoulder_valley,
+    shoulder_valley_slope = shoulder_valley_slope,
+    valley_density_adjust = valley_density_adjust,
+    multi_sample_per_batch= multi_sample_per_batch,
+    midpoint_type         = midpoint_type,
+    detect_outlier_valley = detect_outlier_valley,
+    positive_peak         = positive_peak
+  )
+  
+  list(
+    marker_name       = adt_marker_select_name,
+    tmp_name          = adt_marker_select,
+    norm_col_override = norm_col_override,
+    pars              = pars,
+    sqs_rows          = sqs_rows
+  )
+}
+# -----------------------------------------------------------------------------
+# REFERENCE MODE
+# -----------------------------------------------------------------------------
+.ADTprot_norm_ref <- function(
+    data_counts, 
+    metadata, 
+    file.id, 
+    outdir, 
+    sample_col, 
+    batch_col, 
+    marker_to_process,
+    exclude_zeroes, 
+    bimodal_marker, 
+    trimodal_marker, 
+    positive_peak, 
+    bw_smallest_bi,
+    bw_smallest_tri, 
+    bw_smallest_adjustments, 
+    quantile_clip, 
+    peak_type, 
+    multi_sample_per_batch,
+    shoulder_valley, 
+    shoulder_valley_slope, 
+    valley_density_adjust, 
+    landmark_align_type,
+    midpoint_type, 
+    neg_candidate_thres, 
+    lower_peak_thres, 
+    detect_outlier_valley,
+    target_landmark_location, 
+    clean_adt_name, 
+    override_landmark, 
+    verbose, 
+    saveData,
+    is_transformed,
+    sqs_threshold = 1.0,
+    apply_sqs = "none",
+    do_subsample = TRUE,
+    target_ct = 2000L,
+    # NOTA: estos defaults reflejan los nombres internos que run_scProteinXpress
+    # ya impone vía la "TRADUCCIÓN INTERNA DE METADATOS" (cell.type / tissue /
+    # dataset). Si se llama a .ADTprot_norm_ref con metadata que aún use los
+    # nombres externos (cell_type / dataset_id), hay que pasarlos explícitamente.
+    ct_col = "cell.type",
+    tissue_col = "tissue",
+    dataset_col = "dataset",
+    seed = 1234,
+    ncores = 1L){
+  
+  data_counts <- .as_dense_matrix(data_counts)
+  metadata <- as.data.frame(metadata)
+  
+  adt_in <- make_ADTnorm_input(data_counts, metadata, sample_col, batch_col)
+  cell_x_adt <- adt_in$cell_x_adt
+  cell_x_feature <- adt_in$cell_x_feature
+  
+  mode_info <- .detect_input_mode(cell_x_adt, neg_candidate_thres, is_transformed, verbose)
+  arcsinh_transform_flag <- mode_info$arcsinh_transform_flag
+  neg_candidate_thres <- mode_info$neg_candidate_thres
+  
+  all_marker_name <- colnames(cell_x_adt)
+  col_sums <- colSums(cell_x_adt, na.rm = TRUE)
+  if (any(col_sums == 0)) {
+    keep <- col_sums > 0
+    cell_x_adt <- cell_x_adt[, keep, drop = FALSE]
+    all_marker_name <- colnames(cell_x_adt)
+  }
+  
+  if (arcsinh_transform_flag) {
+    if(verbose) message("Applying arcsinh transformation...")
+    cell_x_adt <- ADTnorm::arcsinh_transform(cell_x_adt = cell_x_adt)
+  }
+  
+  if (!is.factor(cell_x_feature$sample)) cell_x_feature$sample <- factor(cell_x_feature$sample, levels = unique(cell_x_feature$sample))
+  
+  bimodal_marker_index <- which(all_marker_name %in% bimodal_marker)
+  trimodal_marker_index <- if (!is.null(trimodal_marker)) which(all_marker_name %in% trimodal_marker) else NULL
+  
+  original_marker_name <- all_marker_name
+  colnames(cell_x_adt) <- paste0("tmpName", seq_len(ncol(cell_x_adt)))
+  adt_marker_index_list <- seq_len(ncol(cell_x_adt))
+  
+  cell_x_adt_norm <- cell_x_adt
+  
+  bg.prot.pars <- list(
+    method = "ADTnorm-compact", file.id = file.id, sample_col = sample_col, batch_col = batch_col,
+    original_marker_name = original_marker_name,
+    global_settings = list(
+      exclude_zeroes = exclude_zeroes, quantile_clip = quantile_clip, peak_type = peak_type,
+      multi_sample_per_batch = multi_sample_per_batch, shoulder_valley = shoulder_valley,
+      shoulder_valley_slope = shoulder_valley_slope, valley_density_adjust = valley_density_adjust,
+      landmark_align_type = landmark_align_type, midpoint_type = midpoint_type,
+      neg_candidate_thres = neg_candidate_thres, lower_peak_thres = lower_peak_thres,
+      detect_outlier_valley = detect_outlier_valley, target_landmark_location = target_landmark_location,
+      bimodal_marker = bimodal_marker, trimodal_marker = trimodal_marker, positive_peak = positive_peak,
+      bw_smallest_bi = bw_smallest_bi, bw_smallest_tri = bw_smallest_tri, bw_smallest_adjustments = bw_smallest_adjustments,
+      is_transformed_input = is_transformed, 
+      sqs_threshold = sqs_threshold, apply_sqs = apply_sqs
+    ),
+    markers = list()
+  )
+  
+  sqs_log_path <- file.path(outdir, paste0(file.id, "_SQS_ref_log.csv"))
+  
+  # Cap ncores al número de marcadores: no tiene sentido pedir más workers que tareas.
+  effective_ncores <- if (is.numeric(ncores) && length(ncores) == 1L)
+    min(as.integer(ncores), length(adt_marker_index_list)) else 1L
+  
+  cl <- NULL
+  use_parallel <- effective_ncores >= 2L && length(adt_marker_index_list) >= 2L
+  
+  # --- Fijar BLAS a 1 hilo en el proceso master y en cada worker (CLAVE) -----
+  # Sin esto, OpenBLAS/MKL lanzan multi-hilo implícito en density/ splines /etc.
+  # Con N workers * M hilos BLAS la sobresuscripción mata el speedup.
+  # Guardamos el valor previo para restaurarlo al salir.
+  .prev_blas_threads <- NA_integer_
+  .prev_omp_threads  <- Sys.getenv("OMP_NUM_THREADS", unset = NA)
+  .prev_mkl_threads  <- Sys.getenv("MKL_NUM_THREADS", unset = NA)
+  .prev_openblas_t   <- Sys.getenv("OPENBLAS_NUM_THREADS", unset = NA)
+  if (use_parallel) {
+    if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+      .prev_blas_threads <- tryCatch(RhpcBLASctl::blas_get_num_procs(),
+                                     error = function(e) NA_integer_)
+      try(RhpcBLASctl::blas_set_num_threads(1L),  silent = TRUE)
+      try(RhpcBLASctl::omp_set_num_threads(1L),   silent = TRUE)
+    }
+    # Fallback vía env-vars (afecta a workers fork; PSOCK los hereda).
+    Sys.setenv(OMP_NUM_THREADS      = "1")
+    Sys.setenv(MKL_NUM_THREADS      = "1")
+    Sys.setenv(OPENBLAS_NUM_THREADS = "1")
+  }
+  
+  if (use_parallel) {
+    try(unregister_dopar(), silent = TRUE)
+    cl <- tryCatch({
+      if (.Platform$OS.type == "unix") {
+        parallel::makeForkCluster(nnodes = effective_ncores)
+      } else {
+        parallel::makePSOCKcluster(effective_ncores)
+      }
+    }, error = function(e) {
+      message("[parallel] No se pudo crear cluster (", conditionMessage(e),
+              "); ejecutando en secuencial.")
+      NULL
+    })
+    if (!is.null(cl)) {
+      doParallel::registerDoParallel(cl)
+      # Asegurar en workers PSOCK también (fork hereda env-vars del padre).
+      if (.Platform$OS.type != "unix") {
+        try(parallel::clusterEvalQ(cl, {
+          Sys.setenv(OMP_NUM_THREADS = "1",
+                     MKL_NUM_THREADS = "1",
+                     OPENBLAS_NUM_THREADS = "1")
+          if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+            try(RhpcBLASctl::blas_set_num_threads(1L), silent = TRUE)
+            try(RhpcBLASctl::omp_set_num_threads(1L),  silent = TRUE)
+          }
+        }), silent = TRUE)
+      }
+    }
+  }
+  
+  # Log explícito: no dejar duda de si la paralelización está activa.
+  if (use_parallel && !is.null(cl)) {
+    message(sprintf("[PARALLEL][ref] Cluster creado: %d workers (%s) para %d marcadores.",
+                    effective_ncores,
+                    if (.Platform$OS.type == "unix") "fork" else "PSOCK",
+                    length(adt_marker_index_list)))
+  } else {
+    message(sprintf("[PARALLEL][ref] Ejecución SECUENCIAL (ncores=%s, use_parallel=%s).",
+                    as.character(ncores), as.character(use_parallel)))
+  }
+  
+  on.exit({
+    if (!is.null(cl)) {
+      try(parallel::stopCluster(cl), silent = TRUE)
+      try(foreach::registerDoSEQ(), silent = TRUE)
+      try(unregister_dopar(), silent = TRUE)
+    }
+    # Restaurar hilos BLAS/OMP/MKL previos.
+    if (!is.na(.prev_blas_threads) && requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+      try(RhpcBLASctl::blas_set_num_threads(.prev_blas_threads), silent = TRUE)
+    }
+    if (is.na(.prev_omp_threads))  Sys.unsetenv("OMP_NUM_THREADS")      else Sys.setenv(OMP_NUM_THREADS      = .prev_omp_threads)
+    if (is.na(.prev_mkl_threads))  Sys.unsetenv("MKL_NUM_THREADS")      else Sys.setenv(MKL_NUM_THREADS      = .prev_mkl_threads)
+    if (is.na(.prev_openblas_t))   Sys.unsetenv("OPENBLAS_NUM_THREADS") else Sys.setenv(OPENBLAS_NUM_THREADS = .prev_openblas_t)
+  }, add = TRUE)
+  
+  .pkgs_needed <- c("Matrix", "stats", "utils", "ADTnorm")
+  .exports_needed <- c(
+    ".run_one_marker_ref", ".safe_to_matrix", ".as_dense_matrix",
+    ".build_target_landmark", ".extract_align_field",
+    ".sqs_compute_per_sample", ".sqs_one_peak", ".sqs_two_peak",
+    ".sqs_multi_peak", ".sqs_valley_deep_scaler", ".sqs_area_under_curve",
+    ".get_peak_mode_patched"
+  )
+
+  `%OP%` <- if (use_parallel && !is.null(cl)) `%dopar%` else `%do%`
+  
+  # -------------------------------------------------------------------------
+  # PAYLOAD REDUCIDO POR WORKER (CLAVE para matrices grandes)
+  # ---------------------------------------------------------------------
+  # En el diseño anterior cada worker recibía cell_x_adt y cell_x_feature
+  # completos. Con fork esto usa COW pero, en R, `cell_x_adt[, j] <- NA`
+  # dentro del worker dispara copy-on-modify a nivel de objeto → cada
+  # worker duplicaba la matriz entera en RAM (oversubscription → thrashing).
+  # Aquí pre-extraemos SÓLO la columna del marcador + un slim del
+  # feature-frame (sample, batch). El helper sigue siendo funcional porque
+  # sus llamadas internas (get_peak_mode, get_valley_location, etc.)
+  # operan sobre cell_x_adt_sub[, adt_marker_select], que es exactamente
+  # esa columna.
+  # -------------------------------------------------------------------------
+  sample_vec_full <- cell_x_feature$sample
+  feature_slim    <- cell_x_feature[, intersect(c("sample", "batch"),
+                                                colnames(cell_x_feature)),
+                                    drop = FALSE]
+  # Construir por adelantado la lista de datos por-marcador (UNA SOLA VEZ):
+  # con fork esto se comparte por COW; con PSOCK se serializa sólo lo mínimo.
+  marker_payload <- lapply(adt_marker_index_list, function(k) {
+    tmp_name <- colnames(cell_x_adt)[k]
+    list(
+      adt_marker_index = k,
+      tmp_name         = tmp_name,
+      marker_col       = cell_x_adt[, tmp_name, drop = TRUE]
+    )
+  })
+  
+  t_foreach <- proc.time()
+  marker_results <- foreach::foreach(
+    payload          = marker_payload,
+    .packages        = .pkgs_needed,
+    .export          = .exports_needed,
+    .errorhandling   = "pass"
+  ) %OP% {
+    # Reconstruir una matriz de UNA columna con el mismo rowname que esperan
+    # get_peak_mode / get_valley_location / peak_alignment.
+    local_mat <- matrix(payload$marker_col, ncol = 1L,
+                        dimnames = list(names(payload$marker_col), payload$tmp_name))
+    
+    .run_one_marker_ref(
+      adt_marker_index         = 1L,                     # siempre 1 en la submatriz
+      cell_x_adt               = local_mat,
+      cell_x_feature           = feature_slim,
+      original_marker_name     = original_marker_name[payload$adt_marker_index],
+      quantile_clip            = quantile_clip,
+      bw_smallest_bi           = bw_smallest_bi,
+      bw_smallest_tri          = bw_smallest_tri,
+      bw_smallest_adjustments  = bw_smallest_adjustments,
+      bimodal_marker_index     = if (payload$adt_marker_index %in% bimodal_marker_index) 1L else integer(0),
+      trimodal_marker_index    = if (payload$adt_marker_index %in% trimodal_marker_index) 1L else integer(0),
+      positive_peak            = positive_peak,
+      peak_type                = peak_type,
+      neg_candidate_thres      = neg_candidate_thres,
+      lower_peak_thres         = lower_peak_thres,
+      arcsinh_transform_flag   = arcsinh_transform_flag,
+      shoulder_valley          = shoulder_valley,
+      multi_sample_per_batch   = multi_sample_per_batch,
+      valley_density_adjust    = valley_density_adjust,
+      shoulder_valley_slope    = shoulder_valley_slope,
+      detect_outlier_valley    = detect_outlier_valley,
+      sqs_threshold            = sqs_threshold,
+      apply_sqs                = apply_sqs,
+      file.id                  = file.id,
+      landmark_align_type      = landmark_align_type,
+      midpoint_type            = midpoint_type,
+      target_landmark_location = target_landmark_location
+    )
+  }
+  message(sprintf("[TIMING][ref] foreach elapsed: %.2fs",
+                  (proc.time() - t_foreach)[["elapsed"]]))
+  
+  # Reasignar tmp_name real (el helper lo devolvió como el de la submatriz).
+  for (i in seq_along(marker_results)) {
+    if (!inherits(marker_results[[i]], "error") &&
+        !is.null(marker_results[[i]]) &&
+        !is.null(marker_results[[i]]$tmp_name)) {
+      marker_results[[i]]$tmp_name <- marker_payload[[i]]$tmp_name
+    }
+  }
+  
+  if (!is.null(cl)) {
+    try(parallel::stopCluster(cl), silent = TRUE)
+    try(foreach::registerDoSEQ(), silent = TRUE)
+    try(unregister_dopar(), silent = TRUE)
+    cl <- NULL
+  }
+  
+  for (res in marker_results) {
+    if (inherits(res, "error") || is.null(res) || is.null(res$tmp_name)) {
+      msg <- if (inherits(res, "error")) conditionMessage(res) else "resultado inválido"
+      message("[parallel] Un worker falló: ", msg, " (se salta el marker).")
+      next
+    }
+    if (!is.null(res$norm_col_override)) {
+      cell_x_adt_norm[, res$tmp_name] <- res$norm_col_override
+    }
+    if (!is.null(res$pars)) {
+      bg.prot.pars$markers[[res$marker_name]] <- res$pars
+    }
+    for (row in res$sqs_rows) .sqs_log_append(sqs_log_path, row)
+  }
+  
+  colnames(cell_x_adt_norm) <- original_marker_name
+  norm_fxC <- t(as.matrix(cell_x_adt_norm))
+  
+  if (do_subsample) {
+    if (verbose) message("Aplicando subsampling jerárquico...")
+    set.seed(seed)
+    
+    if (!"cell_id" %in% colnames(metadata)) {
+      metadata$cell_id <- rownames(metadata)
+    }
+    
+    all_na_cells <- rowSums(!is.na(cell_x_adt_norm)) == 0
+    if (any(all_na_cells)) {
+      drop_ids <- rownames(cell_x_adt_norm)[all_na_cells]
+      if (verbose) message("SQS: excluyendo ", length(drop_ids),
+                           " células con el 100% de marcadores en NA del pool de subsampling.")
+      metadata <- metadata[!(metadata$cell_id %in% drop_ids), , drop = FALSE]
+    }
+    
+    alloc_bal <- function(tgt, caps) {
+      caps <- caps[caps > 0]; if(length(caps) == 0) return(NULL)
+      if(sum(caps) < tgt) return(caps)
+      al <- setNames(integer(length(caps)), names(caps))
+      while(tgt > 0) {
+        act <- names(caps)[caps > al]; act <- act[order(al[act])]
+        tk <- act[seq_len(min(tgt, length(act)))]; al[tk] <- al[tk] + 1L; tgt <- tgt - length(tk)
+      }
+      return(al)
+    }
+    
+    selected_ids <- character()
+    
+    for(c in unique(metadata[[ct_col]])) {
+      if (is.na(c)) next
+      df_c <- metadata[metadata[[ct_col]] == c, ]
+      
+      t_al <- alloc_bal(target_ct, table(df_c[[tissue_col]]))
+      if(is.null(t_al)) next
+      
+      for(tn in names(t_al)[t_al > 0]) {
+        df_t <- df_c[df_c[[tissue_col]] == tn, ]
+        
+        d_al <- alloc_bal(t_al[[tn]], table(df_t[[dataset_col]]))
+        if(is.null(d_al)) next
+        
+        for(dn in names(d_al)[d_al > 0]) {
+          ids <- df_t$cell_id[df_t[[dataset_col]] == dn]
+          selected_ids <- c(selected_ids, sample(ids, d_al[[dn]], replace = FALSE))
+        }
+      }
+    }
+    
+    valid_ids <- intersect(selected_ids, colnames(norm_fxC))
+    
+    if (length(valid_ids) == 0) {
+      warning("El subsampling devolvió 0 células o los IDs no cruzan con norm_fxC. Se devuelve matriz original.")
+    } else {
+      norm_fxC <- norm_fxC[, valid_ids, drop = FALSE]
+      if (verbose) message("Subsampling finalizado. Células retenidas: ", ncol(norm_fxC))
+    }
+  }
+  
+  if ("cell_id" %in% colnames(metadata)) {
+    metadata <- metadata[metadata$cell_id %in% colnames(norm_fxC), , drop = FALSE]
+  } else {
+    metadata <- metadata[rownames(metadata) %in% colnames(norm_fxC), , drop = FALSE]
+  }
+  
+  if (saveData) {
+    saveRDS(norm_fxC, file = file.path(outdir, paste0(file.id, "_NormData.rds")))
+    saveRDS(bg.prot.pars, file = file.path(outdir, paste0(file.id, "_bg_prot_pars.rds")))
+    saveRDS(metadata, file = file.path(outdir, paste0(file.id, "_Metadata.rds")))
+  }
+  
+  norm_fxC
+}
+# -----------------------------------------------------------------------------
+# .run_one_marker_query  [NUEVO]
+# -----------------------------------------------------------------------------
+.run_one_marker_query <- function(marker_name, adt_marker_select, adt_marker_index,
+                                  cell_x_adt, cell_x_feature, marker_pars, gs, mode_info,
+                                  file.id, sqs_threshold, apply_sqs) {
+  
+  out_skip <- list(
+    marker_name       = marker_name,
+    tmp_name          = adt_marker_select,
+    norm_col_override = NULL,  # Se mantiene la filosofía: NULL = ignorar en master
+    sqs_rows          = list()
+  )
+  
+  marker_vec <- cell_x_adt[, adt_marker_select]
+  if (gs$quantile_clip < 1) {
+    quant <- stats::quantile(marker_vec, gs$quantile_clip, na.rm = TRUE)
+    clip_idx <- !is.na(marker_vec) & (marker_vec > quant)
+    marker_vec[clip_idx] <- NA
+  }
+  
+  valid_samples <- c()
+  for (s in levels(cell_x_feature$sample)) {
+    vals <- marker_vec[cell_x_feature$sample == s]
+    valid_vals <- vals[is.finite(vals)]
+    if (length(valid_vals) >= 5 && length(unique(valid_vals)) >= 3 && stats::var(valid_vals) > 1e-6) {
+      valid_samples <- c(valid_samples, s)
+    }
+  }
+  
+  # Si no hay muestras válidas, se devuelve el vector recortado y se salta (como el secuencial)
+  if (length(valid_samples) == 0) {
+    return(list(marker_name = marker_name, tmp_name = adt_marker_select,
+                norm_col_override = marker_vec, sqs_rows = list()))
+  }
+  
+  valid_idx <- cell_x_feature$sample %in% valid_samples
+  cell_x_adt_sub <- cell_x_adt[valid_idx, , drop = FALSE]
+  cell_x_adt_sub[, adt_marker_select] <- marker_vec[valid_idx]
+  cell_x_feature_sub <- cell_x_feature[valid_idx, , drop = FALSE]
+  cell_x_feature_sub$sample <- factor(cell_x_feature_sub$sample, levels = valid_samples)
+  
+  peak_mode_res <- tryCatch({
+    if (marker_pars$peak_type == "mode") {
+      .get_peak_mode_patched(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index, marker_pars$bwFac_smallest, gs$bimodal_marker_index, gs$trimodal_marker_index, marker_pars$positive_peak, marker_pars$neg_candidate_thres, marker_pars$lower_peak_thres, mode_info$arcsinh_transform_flag)
+    } else {
+      ADTnorm::get_peak_midpoint(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index, marker_pars$bwFac_smallest, gs$bimodal_marker_index, gs$trimodal_marker_index, marker_pars$positive_peak, marker_pars$neg_candidate_thres, marker_pars$lower_peak_thres, mode_info$arcsinh_transform_flag)
+    }
+  }, error = function(e) NULL)
+  
+  if (is.null(peak_mode_res)) return(out_skip)
+  
+  peak_mode_res_raw <- peak_mode_res
+  ref_n <- length(marker_pars$fixed_target_landmark)
+  peak_mode_res <- .coerce_peak_mode_to_reference(peak_mode_res, ref_n)
+  
+  peak_valley_list <- tryCatch(
+    ADTnorm::get_valley_location(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, peak_mode_res, marker_pars$shoulder_valley, marker_pars$positive_peak, marker_pars$multi_sample_per_batch, marker_pars$valley_density_adjust, 20, marker_pars$shoulder_valley_slope, marker_pars$neg_candidate_thres, mode_info$arcsinh_transform_flag),
+    error = function(e) NULL
+  )
+  
+  if (is.null(peak_valley_list)) return(out_skip)
+  
+  valley_location_res_raw   <- peak_valley_list$valley_location_list
+  peak_landmark_list_raw    <- peak_valley_list$peak_landmark_list
+  valley_location_res <- peak_valley_list$valley_location_list
+  peak_landmark_list <- .coerce_peak_mode_to_reference(peak_valley_list$peak_landmark_list, ref_n)
+  
+  if (marker_pars$detect_outlier_valley != FALSE) {
+    valley_location_res <- tryCatch(
+      ADTnorm::detect_impute_outlier_valley(valley_location_res, adt_marker_select, cell_x_adt_sub, cell_x_feature_sub, 3, marker_pars$detect_outlier_valley, 3, 0.75),
+      error = function(e) NULL
+    )
+  }
+  
+  sqs_rows <- list()
+  norm_col_override <- cell_x_adt[, adt_marker_select] 
+  
+  peak_info_raw_mat   <- .safe_to_matrix(peak_landmark_list_raw,  valid_samples)
+  valley_info_raw_mat <- .safe_to_matrix(valley_location_res_raw, valid_samples)
+  
+  sqs_scores_q <- .sqs_compute_per_sample(
+    marker_vec    = cell_x_adt_sub[, adt_marker_select],
+    sample_vec    = as.character(cell_x_feature_sub$sample),
+    valid_samples = valid_samples,
+    peak_info     = peak_info_raw_mat,
+    valley_info   = valley_info_raw_mat
+  )
+  
+  for (s in valid_samples) {
+    sqs_rows[[length(sqs_rows) + 1L]] <- data.frame(
+      stage      = "query",
+      file.id    = file.id,
+      marker     = marker_name,
+      sample     = s,
+      sqs        = unname(sqs_scores_q[s]),
+      threshold  = sqs_threshold,
+      apply_sqs  = apply_sqs,
+      action     = if (apply_sqs == "both" && sqs_scores_q[s] < sqs_threshold) "NA" else "keep",
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  if (apply_sqs == "both") {
+    fail_samples_q <- names(sqs_scores_q)[sqs_scores_q < sqs_threshold]
+    if (length(fail_samples_q) > 0) {
+      fail_idx_q <- cell_x_feature$sample %in% fail_samples_q
+      norm_col_override[fail_idx_q] <- NA_real_
+      
+      keep_mask_q     <- !(valid_samples %in% fail_samples_q)
+      valid_samples   <- valid_samples[keep_mask_q]
+      peak_landmark_list  <- peak_landmark_list[keep_mask_q, , drop = FALSE]
+      if (!is.null(valley_location_res)) {
+        valley_location_res <- .safe_to_matrix(valley_location_res, rownames(peak_info_raw_mat))
+        valley_location_res <- valley_location_res[keep_mask_q, , drop = FALSE]
+      }
+      
+      if (length(valid_samples) == 0) {
+        return(list(marker_name = marker_name, tmp_name = adt_marker_select, norm_col_override = norm_col_override, sqs_rows = sqs_rows))
+      }
+      
+      valid_idx <- cell_x_feature$sample %in% valid_samples
+      cell_x_adt_sub     <- cell_x_adt[valid_idx, , drop = FALSE]
+      cell_x_adt_sub[, adt_marker_select] <- marker_vec[valid_idx]
+      cell_x_feature_sub <- cell_x_feature[valid_idx, , drop = FALSE]
+      cell_x_feature_sub$sample <- factor(cell_x_feature_sub$sample, levels = valid_samples)
+    }
+  }
+  
+  full_samples <- levels(cell_x_feature$sample)
+  peak_landmark_list <- .safe_to_matrix(peak_landmark_list, valid_samples)
+  pm_full <- matrix(NA_real_, nrow = length(full_samples), ncol = ncol(peak_landmark_list))
+  rownames(pm_full) <- full_samples
+  pm_full[valid_samples, ] <- peak_landmark_list
+  peak_mode_res_final <- pm_full
+  
+  valley_location_res <- .safe_to_matrix(valley_location_res, valid_samples)
+  vl_full <- matrix(NA_real_, nrow = length(full_samples), ncol = ncol(valley_location_res))
+  rownames(vl_full) <- full_samples
+  vl_full[valid_samples, ] <- valley_location_res
+  valley_location_res_final <- vl_full
+  
+  landmark_matrix <- tryCatch(
+    ADTnorm::landmark_fill_na(peak_mode_res_final, valley_location_res_final, gs$landmark_align_type, marker_pars$midpoint_type, marker_pars$neg_candidate_thres),
+    error = function(e) NULL
+  )
+  
+  if (is.null(landmark_matrix)) {
+    return(list(marker_name = marker_name, tmp_name = adt_marker_select, norm_col_override = norm_col_override, sqs_rows = sqs_rows))
+  }
+  
+  fixed_target_landmark <- marker_pars$fixed_target_landmark
+  landmark_matrix <- .coerce_landmark_matrix_to_reference(landmark_matrix, fixed_target_landmark, marker_pars$neg_candidate_thres)
+  
+  align_res <- tryCatch(
+    ADTnorm::peak_alignment(cell_x_adt_sub[, adt_marker_select], cell_x_feature_sub, landmark_matrix[valid_samples, , drop=FALSE], fixed_target_landmark, "fixed", marker_pars$warp_parameters),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(align_res)) {
+    norm_col_override[valid_idx] <- .extract_align_field(align_res, "cell_x_adt_norm", pos = 1)
+  }
+  
+  list(marker_name = marker_name, tmp_name = adt_marker_select, norm_col_override = norm_col_override, sqs_rows = sqs_rows)
+}
+
+# -----------------------------------------------------------------------------
+# QUERY MODE
+# -----------------------------------------------------------------------------
+.ADTprot_norm_query <- function(data_counts, metadata, bg.prot.pars, file.id, outdir,
+                                sample_col, batch_col, marker_to_process, verbose,
+                                saveData, is_transformed,
+                                ## T-4: defaults aligned across the chain so SQS is
+                                ## off-by-default. Callers downstream of run_scProteinXpress
+                                ## still inherit gs$apply_sqs from bg.prot.pars when
+                                ## available (see ADTprot_norm wrapper, line ~1518).
+                                sqs_threshold = 1.0, apply_sqs = "none",
+                                ncores = 1L){
+  ## T-5: validate bg.prot.pars before touching anything else. An empty or
+  ## malformed reference fitted-parameters list would otherwise surface as a
+  ## confusing "subscript out of bounds" deep inside the foreach loop.
+  if (is.null(bg.prot.pars) || !is.list(bg.prot.pars) ||
+      is.null(bg.prot.pars$markers) || length(bg.prot.pars$markers) == 0L) {
+    stop(".ADTprot_norm_query: bg.prot.pars must contain a non-empty `markers` list ",
+         "(loaded from <Ref>/<file.name>_bg_prot_pars.rds).")
+  }
+  if (is.null(bg.prot.pars$global_settings)) {
+    stop(".ADTprot_norm_query: bg.prot.pars$global_settings is missing.")
+  }
+
+  data_counts <- .as_dense_matrix(data_counts)
+  metadata <- as.data.frame(metadata)
+
+  ref_markers <- names(bg.prot.pars$markers)
+  ## T-5: explicit Ref/Query marker intersection check. .pad_to_features pads
+  ## with NA, so the matrix would survive even with zero overlap. Detect that
+  ## case explicitly because it is almost always a metadata/panel mismatch.
+  query_markers <- rownames(data_counts)
+  if (length(intersect(ref_markers, query_markers)) == 0L) {
+    stop(sprintf(
+      ".ADTprot_norm_query: no overlap between query markers (%d) and Ref markers (%d). ",
+      length(query_markers), length(ref_markers)),
+      "Examples query: ", paste(utils::head(query_markers, 5), collapse = ", "),
+      "; examples Ref: ", paste(utils::head(ref_markers, 5), collapse = ", "))
+  }
+  data_counts <- .pad_to_features(data_counts, ref_markers)
+  
+  adt_in <- make_ADTnorm_input(data_counts, metadata, sample_col, batch_col)
+  cell_x_adt <- adt_in$cell_x_adt
+  cell_x_feature <- adt_in$cell_x_feature
+  gs <- bg.prot.pars$global_settings
+  
+  mode_info <- .detect_input_mode(cell_x_adt, gs$neg_candidate_thres, is_transformed, verbose)
+  if (mode_info$arcsinh_transform_flag) {
+    if(verbose) message("Applying arcsinh transformation to query...")
+    cell_x_adt <- ADTnorm::arcsinh_transform(cell_x_adt = cell_x_adt)
+  }
+  
+  if (!is.factor(cell_x_feature$sample)) cell_x_feature$sample <- factor(cell_x_feature$sample, levels = unique(cell_x_feature$sample))
+  
+  original_marker_name <- colnames(cell_x_adt)
+  colnames(cell_x_adt) <- paste0("tmpName", seq_len(ncol(cell_x_adt)))
+  name_map <- stats::setNames(colnames(cell_x_adt), original_marker_name)
+  
+  markers_to_run <- ref_markers
+  cell_x_adt_norm <- cell_x_adt[, name_map[markers_to_run], drop = FALSE]
+  
+  sqs_log_path_q <- file.path(outdir, paste0(file.id, "_SQS_query_log.csv"))
+  
+  effective_ncores <- if (is.numeric(ncores) && length(ncores) == 1L)
+    min(as.integer(ncores), length(markers_to_run)) else 1L
+  
+  cl <- NULL
+  use_parallel <- effective_ncores >= 2L && length(markers_to_run) >= 2L
+  
+  # --- Fijar BLAS a 1 hilo por worker: evita oversubscription ---------------
+  .prev_blas_threads <- NA_integer_
+  .prev_omp_threads  <- Sys.getenv("OMP_NUM_THREADS", unset = NA)
+  .prev_mkl_threads  <- Sys.getenv("MKL_NUM_THREADS", unset = NA)
+  .prev_openblas_t   <- Sys.getenv("OPENBLAS_NUM_THREADS", unset = NA)
+  if (use_parallel) {
+    if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+      .prev_blas_threads <- tryCatch(RhpcBLASctl::blas_get_num_procs(),
+                                     error = function(e) NA_integer_)
+      try(RhpcBLASctl::blas_set_num_threads(1L),  silent = TRUE)
+      try(RhpcBLASctl::omp_set_num_threads(1L),   silent = TRUE)
+    }
+    Sys.setenv(OMP_NUM_THREADS      = "1")
+    Sys.setenv(MKL_NUM_THREADS      = "1")
+    Sys.setenv(OPENBLAS_NUM_THREADS = "1")
+  }
+  
+  if (use_parallel) {
+    try(unregister_dopar(), silent = TRUE)
+    cl <- tryCatch({
+      if (.Platform$OS.type == "unix") {
+        parallel::makeForkCluster(nnodes = effective_ncores)
+      } else {
+        parallel::makePSOCKcluster(effective_ncores)
+      }
+    }, error = function(e) {
+      message("[parallel] No se pudo crear cluster (", conditionMessage(e), "); ejecutando en secuencial.")
+      NULL
+    })
+    if (!is.null(cl)) {
+      doParallel::registerDoParallel(cl)
+      if (.Platform$OS.type != "unix") {
+        try(parallel::clusterEvalQ(cl, {
+          Sys.setenv(OMP_NUM_THREADS = "1",
+                     MKL_NUM_THREADS = "1",
+                     OPENBLAS_NUM_THREADS = "1")
+          if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+            try(RhpcBLASctl::blas_set_num_threads(1L), silent = TRUE)
+            try(RhpcBLASctl::omp_set_num_threads(1L),  silent = TRUE)
+          }
+        }), silent = TRUE)
+      }
+    }
+  }
+  
+  if (use_parallel && !is.null(cl)) {
+    message(sprintf("[PARALLEL][query] Cluster creado: %d workers (%s) para %d marcadores.",
+                    effective_ncores,
+                    if (.Platform$OS.type == "unix") "fork" else "PSOCK",
+                    length(markers_to_run)))
+  } else {
+    message(sprintf("[PARALLEL][query] Ejecución SECUENCIAL (ncores=%s, use_parallel=%s).",
+                    as.character(ncores), as.character(use_parallel)))
+  }
+  
+  on.exit({
+    if (!is.null(cl)) {
+      try(parallel::stopCluster(cl), silent = TRUE)
+      try(foreach::registerDoSEQ(), silent = TRUE)
+      try(unregister_dopar(), silent = TRUE)
+    }
+    if (!is.na(.prev_blas_threads) && requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+      try(RhpcBLASctl::blas_set_num_threads(.prev_blas_threads), silent = TRUE)
+    }
+    if (is.na(.prev_omp_threads))  Sys.unsetenv("OMP_NUM_THREADS")      else Sys.setenv(OMP_NUM_THREADS      = .prev_omp_threads)
+    if (is.na(.prev_mkl_threads))  Sys.unsetenv("MKL_NUM_THREADS")      else Sys.setenv(MKL_NUM_THREADS      = .prev_mkl_threads)
+    if (is.na(.prev_openblas_t))   Sys.unsetenv("OPENBLAS_NUM_THREADS") else Sys.setenv(OPENBLAS_NUM_THREADS = .prev_openblas_t)
+  }, add = TRUE)
+  
+  .pkgs_needed <- c("Matrix", "stats", "utils", "ADTnorm")
+  .exports_needed <- c(
+    ".run_one_marker_query", ".safe_to_matrix", ".as_dense_matrix",
+    ".build_target_landmark", ".extract_align_field",
+    ".sqs_compute_per_sample", ".sqs_one_peak", ".sqs_two_peak",
+    ".sqs_multi_peak", ".sqs_valley_deep_scaler", ".sqs_area_under_curve",
+    ".coerce_peak_mode_to_reference", ".coerce_landmark_matrix_to_reference",
+    ".get_peak_mode_patched"
+  )
+  
+  `%OP%` <- if (use_parallel && !is.null(cl)) `%dopar%` else `%do%`
+  
+  t_foreach_q <- proc.time()
+  marker_results_q <- foreach::foreach(
+    marker_name      = markers_to_run,
+    .packages        = .pkgs_needed,
+    .export          = .exports_needed,
+    .errorhandling   = "pass"
+  ) %OP% {
+    adt_marker_select <- name_map[[marker_name]]
+    adt_marker_index <- which(colnames(cell_x_adt) == adt_marker_select)
+    marker_pars <- bg.prot.pars$markers[[marker_name]]
+    
+    .run_one_marker_query(
+      marker_name = marker_name,
+      adt_marker_select = adt_marker_select,
+      adt_marker_index = adt_marker_index,
+      cell_x_adt = cell_x_adt,
+      cell_x_feature = cell_x_feature,
+      marker_pars = marker_pars,
+      gs = gs,
+      mode_info = mode_info,
+      file.id = file.id,
+      sqs_threshold = sqs_threshold,
+      apply_sqs = apply_sqs
+    )
+  }
+  message(sprintf("[TIMING][query] foreach elapsed: %.2fs",
+                  (proc.time() - t_foreach_q)[["elapsed"]]))
+  
+  if (!is.null(cl)) {
+    try(parallel::stopCluster(cl), silent = TRUE)
+    try(foreach::registerDoSEQ(), silent = TRUE)
+    try(unregister_dopar(), silent = TRUE)
+    cl <- NULL
+  }
+  
+  for (res in marker_results_q) {
+    if (inherits(res, "error") || is.null(res) || is.null(res$tmp_name)) {
+      msg <- if (inherits(res, "error")) conditionMessage(res) else "resultado inválido"
+      message("[parallel] Un worker falló: ", msg, " (se salta el marker en query).")
+      next
+    }
+    if (!is.null(res$norm_col_override)) {
+      cell_x_adt_norm[, res$tmp_name] <- res$norm_col_override
+    }
+    for (row in res$sqs_rows) .sqs_log_append(sqs_log_path_q, row)
+  }
+  
+  colnames(cell_x_adt_norm) <- markers_to_run
+  norm_fxC <- t(as.matrix(cell_x_adt_norm))
+  
+  if (saveData) saveRDS(norm_fxC, file = file.path(outdir, paste0(file.id, "_NormData.rds")))
+  norm_fxC
+}
+###############################################################################
+# Public wrapper
+###############################################################################
+#' Reference / query ADT normalisation
+#'
+#' Dispatcher around `.ADTprot_norm_ref()` / `.ADTprot_norm_query()` that
+#' enforces SLURM-aware parallelisation and the documented Mode C QC
+#' filters when invoked through `run_scProteinXpress()`.
+#'
+#' @param data_counts proteins x cells matrix or Matrix.
+#' @param metadata data.frame; must contain `cell.id`, `sample`, `batch`.
+#' @param data.type "Ref" or "query".
+#' @param file.id character(1) used as filename prefix.
+#' @param bg.prot.pars list returned by Ref; ignored for Ref builds.
+#' @param saveData,return,outdir,sample_col,batch_col,marker_to_process
+#'   See `.ADTprot_norm_ref` / `.ADTprot_norm_query`.
+#' @param ... ADTnorm parameters (peak_type, multi_sample_per_batch, ...).
+#' @return Normalised proteins x cells matrix.
+#' @export
+ADTprot_norm <- function(data_counts,
+                         metadata, 
+                         data.type = c("Ref", "query"), 
+                         file.id = "mydata", 
+                         bg.prot.pars = NULL, 
+                         saveData = TRUE, 
+                         return = TRUE, 
+                         outdir = ".", 
+                         sample_col = "sample", 
+                         batch_col = "batch", 
+                         marker_to_process = NULL, 
+                         exclude_zeroes = FALSE, 
+                         bimodal_marker = NULL, 
+                         trimodal_marker = NULL, 
+                         positive_peak = NULL, 
+                         bw_smallest_bi = 1.1, 
+                         bw_smallest_tri = 0.8, 
+                         bw_smallest_adjustments =  list(CD3 = 0.8, CD4 = 0.8, CD8A = 0.8, CD8B = 0.8), 
+                         quantile_clip = 1, 
+                         peak_type = "mode", 
+                         multi_sample_per_batch = FALSE, 
+                         shoulder_valley = TRUE, 
+                         shoulder_valley_slope = -0.5, 
+                         valley_density_adjust = 3, 
+                         landmark_align_type = "negPeak_valley_posPeak", 
+                         midpoint_type = "valley", 
+                         neg_candidate_thres = NULL, 
+                         lower_peak_thres = 0.001, 
+                         detect_outlier_valley = FALSE, 
+                         target_landmark_location = NULL, 
+                         clean_adt_name = FALSE, 
+                         override_landmark = NULL, 
+                         verbose = TRUE, 
+                         is_transformed = NULL,
+                         sqs_threshold = 1.0,
+                         apply_sqs = "none",
+                         # --- Subsampling jerárquico (solo aplica a la rama Ref) ---
+                         # do_subsample debe permanecer TRUE para garantizar que
+                         # el background siempre se construye con un nº balanceado
+                         # de células por (cell_type x tissue x dataset). target_ct
+                         # es el cap por cell_type y es el único parámetro que se
+                         # expone para configurar el tamaño del filtro.
+                         do_subsample = TRUE,
+                         target_ct = 2000L,
+                         ncores = 1L){
+  data.type <- match.arg(data.type)
+  apply_sqs <- match.arg(apply_sqs, choices = c("ref_only", "both", "none"))
+  if (data.type == "Ref") {
+    res <- .ADTprot_norm_ref(data_counts, metadata, file.id, outdir, sample_col, 
+                             batch_col, marker_to_process, exclude_zeroes, 
+                             bimodal_marker, trimodal_marker, positive_peak, 
+                             bw_smallest_bi, bw_smallest_tri, bw_smallest_adjustments, 
+                             quantile_clip, peak_type, multi_sample_per_batch, 
+                             shoulder_valley, shoulder_valley_slope, valley_density_adjust, 
+                             landmark_align_type, midpoint_type, neg_candidate_thres, 
+                             lower_peak_thres, detect_outlier_valley, target_landmark_location, 
+                             clean_adt_name, override_landmark, verbose, saveData, is_transformed,
+                             sqs_threshold = sqs_threshold, apply_sqs = apply_sqs,
+                             do_subsample = do_subsample, target_ct = target_ct,
+                             ncores = ncores)
+  } else {
+    if (!is.null(bg.prot.pars) && !is.null(bg.prot.pars$global_settings)) {
+      gs <- bg.prot.pars$global_settings
+      if (missing(sqs_threshold) && !is.null(gs$sqs_threshold)) sqs_threshold <- gs$sqs_threshold
+      if (missing(apply_sqs)     && !is.null(gs$apply_sqs))     apply_sqs     <- gs$apply_sqs
+    }
+    res <- .ADTprot_norm_query(data_counts, metadata, bg.prot.pars, file.id, outdir, sample_col, 
+                               batch_col, marker_to_process, verbose, saveData, is_transformed,
+                               sqs_threshold = sqs_threshold, apply_sqs = apply_sqs,
+                               ncores = ncores)
+  }
+  if (return) return(res)
+  invisible(NULL)
+}
+###############################################################################
+# Query prep for scProteinXpress
+# ----------------------------------------------------------------------------
+# Combines:
+#   - P2 (Mode C) global QC with audit CSV (current upload)
+#   - ncores propagation to ADTprot_norm (baseline _080526)
+#   - verbose = TRUE for ADTprot_norm calls (baseline)
+###############################################################################
+#' Prepare a query against an existing reference background
+#'
+#' Runs the Mode C global QC, ADTnorm query alignment to the Ref landmarks,
+#' and the compatibility scaleMaxGexp() step.
+#'
+#' @param query_dat proteins x cells matrix.
+#' @param query_metadata data.frame.
+#' @param Ref_data Path to the reference directory (containing `_sf.txt`
+#'   and `_bg_prot_pars.rds`) or an in-memory list.
+#' @param dir Output directory.
+#' @param sfback Optional pre-loaded scaling-factor data.frame.
+#' @param file.id character(1) used as filename prefix.
+#' @param bg.prot.pars Pre-loaded reference normalisation parameters.
+#' @param normalise,scale_data,saveData,return.data logical switches.
+#' @param is_transformed NULL / TRUE / FALSE; see `run_scProteinXpress()`.
+#' @param sqs_threshold,apply_sqs SQS controls; see `run_scProteinXpress()`.
+#' @param min.cells.feature,min.coverage.fraction Mode C marker filter.
+#' @param qc_outlier_cells "no" / "yes"; resolved upstream.
+#' @param qc_nmads MAD threshold for scuttle::isOutlier.
+#' @param ncores integer >= 1.
+#' @return Scaled proteins x cells matrix.
+#' @export
+PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback = NA,
+                              file.id = "query", bg.prot.pars, normalise = TRUE,
+                              scale_data = TRUE, saveData = TRUE, return.data = TRUE,
+                              is_transformed = NULL,
+                              ## T-4: aligned with the rest of the chain (none = off).
+                              sqs_threshold = 1.0, apply_sqs = "none",
+                              # P2: global coverage filters (Mode C)
+                              min.cells.feature     = 10,
+                              min.coverage.fraction = 0.10,
+                              # Opt-in cell outlier filter (D2 follow-up); resolved
+                              # upstream by run_scProteinXpress -- this function expects
+                              # the concrete "yes" / "no" string here.
+                              qc_outlier_cells = c("no", "yes"),
+                              qc_nmads = 3,
+                              # Parallelisation forwarded to ADTprot_norm
+                              ncores = 1L){
+  qc_outlier_cells <- match.arg(qc_outlier_cells)
+  dir_name <- dir
+  if (!dir.exists(dir_name)) dir.create(dir_name, recursive = TRUE)
+
+  log.file <- file.path(dir_name, paste0(file.id, "_log.txt"))
+  cat("Preparing ADT data: QC + ADTnorm query normalization + compatibility scaling\n",
+      file = log.file, append = TRUE)
+
+  # P2: single global QC with audit CSV (no per-dataset partial filters here).
+  qc <- cleanData_ADT(query_dat, nmads = qc_nmads,
+                      min.cells.feature     = min.cells.feature,
+                      min.coverage.fraction = min.coverage.fraction,
+                      audit_csv_path        = file.path(dir_name,
+                                                        paste0(file.id, "_excluded_markers.csv")),
+                      qc_outlier_cells      = qc_outlier_cells)
+  x_counts <- qc$Counts
+
+  query_metadata <- as.data.frame(query_metadata)
+  query_metadata <- query_metadata[query_metadata$cell.id %in% colnames(x_counts), , drop = FALSE]
+  rownames(query_metadata) <- query_metadata$cell.id
+  query_metadata <- query_metadata[colnames(x_counts), , drop = FALSE]
+
+  if (normalise) {
+    x_norm <- ADTprot_norm(data_counts    = x_counts,
+                           metadata       = query_metadata,
+                           data.type      = "query",
+                           file.id        = file.id,
+                           bg.prot.pars   = bg.prot.pars,
+                           saveData       = saveData,
+                           return         = TRUE,
+                           outdir         = dir_name,
+                           sample_col     = "sample",
+                           batch_col      = "batch",
+                           verbose        = TRUE,
+                           is_transformed = is_transformed,
+                           sqs_threshold  = sqs_threshold,
+                           apply_sqs      = apply_sqs,
+                           ncores         = ncores)
+  } else {
+    x_norm <- x_counts
+  }
+
+  if (!is.data.frame(sfback)) {
+    ## T-5: defensive read of _sf.txt. The file is a 2-column whitespace-
+    ## separated table written by GetBackground(). When absent, fall back to
+    ## sf = 1 per feature (scaleMaxGexp is a no-op for sf == 1). When
+    ## present but malformed, fail loudly so the caller knows the Ref dir
+    ## is corrupted instead of silently scaling by 1.
+    scaling.factors.file <- list.files(Ref_data, pattern = "_sf.txt$", full.names = TRUE)
+    if (length(scaling.factors.file) > 1L) {
+      stop(sprintf("PrepQueryData_ADT: multiple *_sf.txt found in %s: %s",
+                   Ref_data, paste(basename(scaling.factors.file), collapse = ", ")))
+    }
+    if (length(scaling.factors.file) == 1L) {
+      sf <- tryCatch(
+        read.delim(scaling.factors.file[1], sep = " ", row.names = 1, header = FALSE),
+        error = function(e) stop(sprintf(
+          "PrepQueryData_ADT: failed to read scaling factors at %s (%s).",
+          scaling.factors.file[1], conditionMessage(e))))
+      if (!is.data.frame(sf) || nrow(sf) == 0L || ncol(sf) == 0L) {
+        stop(sprintf("PrepQueryData_ADT: scaling factors file at %s is empty or malformed.",
+                     scaling.factors.file[1]))
+      }
+    } else {
+      sf <- data.frame(V2 = rep(1, nrow(x_norm)), row.names = rownames(x_norm))
+    }
+  } else {
+    sf <- sfback
+    if (nrow(sf) == 0L || ncol(sf) == 0L) {
+      stop("PrepQueryData_ADT: `sfback` is empty.")
+    }
+  }
+
+  if (scale_data) {
+    feats_common <- intersect(rownames(x_norm), rownames(sf))
+    x_scaled <- scaleMaxGexp(x_norm, sf, feats_common)
+    if (saveData) saveRDS(x_scaled, file = file.path(dir_name, paste0(file.id, "_ScaledData.rds")))
+  } else {
+    x_scaled <- x_norm
+  }
+  if (return.data) return(x_scaled)
+  invisible(NULL)
+}
+
+# Opt-in cell outlier filter (scuttle::isOutlier on log10 total + detected).
+# Invoked from cleanData_ADT() when `qc_outlier_cells = "yes"`. Pre-unification
+# this logic was always-on inside the CITE-seq cleanData_ADT body; it is now
+# gated by an explicit flag and resolved by modality at the API entry point
+# (run_scProteinXpress: "auto" => yes for CITE-seq, no for CyTOF).
+.cell_outlier_filter <- function(data_counts, nmads = 3) {
+  if (!requireNamespace("scuttle", quietly = TRUE)) {
+    stop(".cell_outlier_filter: scuttle is required for qc_outlier_cells != 'no'.")
+  }
+  qc_input <- as.matrix(data_counts)
+  qc_input[is.na(qc_input)] <- 0
+  qc <- as.data.frame(scuttle::perCellQCMetrics(qc_input))
+  qc$log10_sum <- log10(qc$sum + 1)
+  low_sum      <- scuttle::isOutlier(qc$log10_sum, nmads = nmads, type = "lower")
+  low_detected <- scuttle::isOutlier(qc$detected,  nmads = nmads, type = "lower")
+  bad <- low_sum | low_detected
+  list(Counts = data_counts[, !bad, drop = FALSE], QCMetrics = qc[!bad, , drop = FALSE])
+}
+
+#' Quality-control filter for ADT count matrices
+#'
+#' Applies a Mode C / Option C marker-level filter (both an absolute
+#' non-zero-cell threshold and a coverage-fraction threshold), writes a
+#' per-marker exclusion audit CSV when one is requested, and optionally
+#' applies a cell-level outlier filter (scuttle::isOutlier on log10 total
+#' counts and on number of detected markers) before the marker filter.
+#'
+#' @param data_counts proteins x cells numeric matrix.
+#' @param nmads number of MADs for the scuttle cell-outlier filter.
+#' @param min.cells.feature integer; minimum number of cells with a non-zero
+#'   non-NA value for a marker to be retained.
+#' @param min.coverage.fraction numeric in [0, 1]; minimum fraction of cells
+#'   with any non-NA measurement for a marker to be retained.
+#' @param audit_csv_path optional path. When set, exclusions are written here.
+#' @param qc_outlier_cells one of "no" (default), "yes". When "yes",
+#'   `.cell_outlier_filter()` is run before the marker-level filter. The
+#'   value "auto" is resolved upstream in `run_scProteinXpress()`.
+#' @return list(Counts, QCMetrics).
+#' @export
+cleanData_ADT <- function(data_counts, nmads = 3,
+                          min.cells.feature = 10,
+                          min.coverage.fraction = 0.10,
+                          audit_csv_path = NULL,
+                          qc_outlier_cells = c("no", "yes")){
+  qc_outlier_cells <- match.arg(qc_outlier_cells)
+  ## T-5: argument sanity checks. Returning an empty matrix on bad input
+  ## would surface as confusing downstream errors (e.g. `nrow == 0` deep
+  ## inside ADTprot_norm). Fail at the QC boundary instead.
+  if (!is.numeric(min.cells.feature) || min.cells.feature < 1L) {
+    stop("cleanData_ADT: min.cells.feature must be >= 1; got ", min.cells.feature)
+  }
+  if (!is.numeric(min.coverage.fraction) ||
+      min.coverage.fraction < 0 || min.coverage.fraction > 1) {
+    stop("cleanData_ADT: min.coverage.fraction must be in [0, 1]; got ", min.coverage.fraction)
+  }
+  message("QC (CyTOF/CITE-seq): Filtering markers and empty cells (NAs treated as missing measurements).")
+  data_counts <- .as_dense_matrix(data_counts)
+  if (nrow(data_counts) == 0L || ncol(data_counts) == 0L) {
+    stop(sprintf("cleanData_ADT: input is empty (%d markers x %d cells).",
+                 nrow(data_counts), ncol(data_counts)))
+  }
+  if (is.null(rownames(data_counts))) {
+    stop("cleanData_ADT: data_counts must have rownames (marker names).")
+  }
+
+  ## Opt-in scuttle cell-outlier filter (qc_outlier_cells = "yes"). Runs
+  ## BEFORE marker-level filtering so that the marker coverage statistics
+  ## reflect the cell population that will actually be used downstream.
+  if (identical(qc_outlier_cells, "yes")) {
+    n_before <- ncol(data_counts)
+    outlier_res <- .cell_outlier_filter(data_counts, nmads = nmads)
+    data_counts <- outlier_res$Counts
+    message(sprintf(
+      "[cleanData_ADT] scuttle isOutlier dropped %d / %d cells (nmads = %d).",
+      n_before - ncol(data_counts), n_before, as.integer(nmads)))
+  }
+
+  # Cell-level QC: drop empty cells (no non-zero values across any feature).
+  cell_sums   <- colSums(data_counts, na.rm = TRUE)
+  valid_cells <- cell_sums > 0
+  data_counts <- data_counts[, valid_cells, drop = FALSE]
+
+  n_cells_total <- ncol(data_counts)
+  if (n_cells_total == 0L) {
+    return(list(Counts = data_counts,
+                QCMetrics = data.frame(sum = numeric(0), detected = integer(0))))
+  }
+
+  # Feature-level QC: a marker passes iff it satisfies BOTH
+  #   (a) absolute count: at least `min.cells.feature` cells with non-zero,
+  #       non-NA value (mirrors scGeneXpress' >=10 threshold).
+  #   (b) coverage fraction: at least `min.coverage.fraction` of cells have a
+  #       non-NA measurement (this is a global filter that catches markers
+  #       only present in a tiny fraction of the cohort due to multi-panel
+  #       NA padding -- a problem absent in scRNA-seq).
+  feat_nonzero_cells <- rowSums(!is.na(data_counts) & data_counts > 0)
+  feat_observed_cells <- rowSums(!is.na(data_counts))
+  feat_coverage <- feat_observed_cells / n_cells_total
+
+  pass_abs  <- feat_nonzero_cells  >= min.cells.feature
+  pass_frac <- feat_coverage       >= min.coverage.fraction
+  keep_feat <- pass_abs & pass_frac
+
+  excluded_idx <- which(!keep_feat)
+  if (length(excluded_idx) > 0L) {
+    reason <- ifelse(!pass_abs[excluded_idx] & !pass_frac[excluded_idx], "abs+frac",
+              ifelse(!pass_abs[excluded_idx],                            "abs",
+                                                                          "frac"))
+    audit <- data.frame(
+      marker            = rownames(data_counts)[excluded_idx],
+      n_cells_observed  = feat_observed_cells[excluded_idx],
+      n_cells_nonzero   = feat_nonzero_cells[excluded_idx],
+      coverage_fraction = round(feat_coverage[excluded_idx], 4),
+      reason            = reason,
+      stringsAsFactors  = FALSE
+    )
+    message(sprintf(
+      "[cleanData_ADT] Excluded %d/%d markers (min.cells.feature=%d, min.coverage.fraction=%.2f). Reasons: %s. Examples: %s",
+      length(excluded_idx), nrow(data_counts),
+      as.integer(min.cells.feature), min.coverage.fraction,
+      paste(sprintf("%s=%d", names(table(reason)), as.integer(table(reason))), collapse = ", "),
+      paste(head(audit$marker, 5), collapse = ", ")))
+
+    if (!is.null(audit_csv_path)) {
+      tryCatch({
+        dir.create(dirname(audit_csv_path), showWarnings = FALSE, recursive = TRUE)
+        utils::write.csv(audit, audit_csv_path, row.names = FALSE)
+      }, error = function(e) {
+        warning(sprintf("Could not write excluded-markers CSV to %s: %s",
+                        audit_csv_path, conditionMessage(e)))
+      })
+    }
+  } else {
+    message(sprintf(
+      "[cleanData_ADT] All %d markers passed filters (min.cells.feature=%d, min.coverage.fraction=%.2f).",
+      nrow(data_counts), as.integer(min.cells.feature), min.coverage.fraction))
+  }
+
+  data_counts <- data_counts[keep_feat, , drop = FALSE]
+
+  qc_mock <- data.frame(
+    sum      = colSums(data_counts, na.rm = TRUE),
+    detected = colSums(!is.na(data_counts) & data_counts > 0)
+  )
+  list(Counts = data_counts, QCMetrics = qc_mock)
+}
+.scaleMaxGexp_one <- function(xrow, sf_val) {
+  if (is.na(sf_val) || sf_val == 0) return(xrow)
+  xrow / sf_val
+}
+
+#' Scale a normalised matrix by per-marker factors
+#'
+#' Divides each `genes`-named row of `data_mat` by its scaling factor.
+#'
+#' @param data_mat proteins x cells matrix.
+#' @param scalingfactors named numeric vector or single-column data.frame.
+#' @param genes character vector of marker names to scale.
+#' @return Scaled matrix.
+#' @export
+scaleMaxGexp <- function(data_mat, scalingfactors, genes){
+  get_sf <- function(g) {
+    if (is.numeric(scalingfactors) && !is.null(names(scalingfactors))) return(as.numeric(scalingfactors[g]))
+    return(as.numeric(scalingfactors[g, 1]))
+  }
+  data_s <- foreach::foreach(n = seq_along(genes)) %do% {
+    g <- genes[n]
+    sfv <- get_sf(g)
+    .scaleMaxGexp_one(data_mat[g, ], sfv)
+  }
+  names(data_s) <- genes
+  do.call(rbind, data_s)
+}
+
+.optLowFun  <- function(x, empcdf, maxVal) abs(x * (1 - empcdf(x)))
+.optHighFun <- function(x, empcdf, maxVal) abs(empcdf(x) * (maxVal - x))
+
+minimizeRectangle <- function(empCDF, maxVal, minVal){
+  lowThr  <- optimize(.optLowFun,  interval = c(minVal, maxVal), empcdf = empCDF, maxVal = maxVal, maximum = TRUE)$maximum
+  highThr <- optimize(.optHighFun, interval = c(minVal, maxVal), empcdf = empCDF, maxVal = maxVal, maximum = TRUE)$maximum
+  c(lowThr, highThr)
+}
+
+swap_th <- function(th_dist){
+  lapply(th_dist, function(x) if (x[1] > x[2]) c(x[2], x[1]) else c(x[1], x[2]))
+}
+
+createThresholdDist <- function(gexp){
+  gexp <- as.numeric(gexp)
+  gexp <- gexp[is.finite(gexp)]
+  if (length(gexp) == 0) return(c(0, 0))
+  minv <- min(gexp)
+  maxv <- max(gexp)
+  if (minv >= maxv) return(c(minv, maxv))
+  minimizeRectangle(ecdf(gexp), maxv, minv)
+}
+
+GetThresholds <- function(processed.back, file.id){
+  check <- names(which(sapply(processed.back, length) < 1))
+  if (length(check) > 0) processed.back <- processed.back[setdiff(names(processed.back), check)]
+  th_list <- lapply(processed.back, createThresholdDist)
+  th_list <- swap_th(th_list)
+  names(th_list) <- names(processed.back)
+  th_list
+}
+
+unregister_dopar <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list = ls(name = env), pos = env)
+}
+
+sample.data <- function(cells_dat, cellid, ncells.sample, nlevels){
+  if(nlevels == 1){
+    set <- split(cellid, as.factor(cellid))
+    
+    set_cells <- unlist(sapply(set, function(x){
+      pick <- intersect(names(cells_dat), names(x))
+      if(length(pick) >= 1 && length(x) >= 50){
+        sub_cell <- sample(x = pick, size = ncells.sample, replace = TRUE)
+      } else {
+        sub_cell <- NA
+      }
+      return(sub_cell)
+    }))
+  } else {
+    cell.id.split <- sapply(cellid, function(x) { strsplit(x, "[.]")[[1]][1] }) 
+    set <- split(cellid, as.factor(cell.id.split))
+    
+    set_cells <- unlist(sapply(set, function(x){
+      cell.id.split.tissue <- sapply(x, function(y) { strsplit(y, "[.]")[[1]][2] })
+      set.tissue <- split(x, as.factor(cell.id.split.tissue))
+      
+      nbc <- unlist(lapply(set.tissue, length))
+      n <- round(ncells.sample / length(set.tissue))
+      set.tissue <- set.tissue[which(as.numeric(nbc) >= n)]
+      
+      if(length(set.tissue) == 0) return(NA)
+      sn <- round(ncells.sample / length(set.tissue))
+      
+      set_cells_tis <- unlist(sapply(set.tissue, function(a){
+        picktis <- intersect(names(cells_dat), names(a))
+        if(length(picktis) >= 1 && length(a) >= sn){
+          sub_cell <- sample(x = picktis, size = sn, replace = TRUE)
+        } else {
+          sub_cell <- NA
+        }
+        return(sub_cell)
+      }))
+      
+      set_cells_tis <- set_cells_tis[!is.na(set_cells_tis)]
+      if(length(set_cells_tis) >= 50){
+        if(length(set_cells_tis) != ncells.sample){
+          set_cells_tis <- sample(x = set_cells_tis, size = ncells.sample, replace = TRUE)
+        }
+      } else {
+        set_cells_tis <- NA
+      }
+      return(set_cells_tis)
+    }))
+  }
+  
+  if(is.null(length(set_cells))){
+    return(NULL)
+  } else {
+    set_cells <- set_cells[!is.na(set_cells)]
+    if(length(set_cells) == 0) return(NULL)
+    x <- cells_dat[set_cells]
+    names(x) <- set_cells
+    return(x)
+  }
+}
+
+Background_sampling <- function(counts_norm_mat, cell_clusterid_mat, ncells.sample=100, clusterids_vec=c("cell.type"), min.cells.gexp=10){
+  nlevels <- length(clusterids_vec)
+  cellid <- apply(cell_clusterid_mat, 1, function(x){ paste(x[clusterids_vec], collapse = ".") })
+  names(cellid) <- cell_clusterid_mat$cell.id
+  
+  markers <- rownames(counts_norm_mat)
+  
+  ids_samples_byGene <- lapply(markers, function(m){
+    vals <- counts_norm_mat[m, ]
+    vals <- vals[!is.na(vals) & vals > 0]
+    if(length(vals) < min.cells.gexp) return(NULL)
+    return(sample.data(cells_dat = vals, cellid = cellid, ncells.sample = ncells.sample, nlevels = nlevels))
+  })
+  
+  names(ids_samples_byGene) <- markers
+  ids_samples_byGene <- ids_samples_byGene[!sapply(ids_samples_byGene, is.null)]
+  return(ids_samples_byGene)
+}
+
+RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, clusterids_vec, file.id){
+  sampled.back <- Background_sampling(
+    counts_norm_mat = norm.data, 
+    cell_clusterid_mat = cell_clusterid_mat, 
+    ncells.sample = ncells.sample, 
+    clusterids_vec = clusterids_vec, 
+    min.cells.gexp = 10
+  )
+  GetThresholds(processed.back = sampled.back, file.id = file.id)
+}
+# -----------------------------------------------------------------------------
+# .precompute_bootstrap_inputs
+# -----------------------------------------------------------------------------
+
+.precompute_bootstrap_inputs <- function(data_norm, metadata, clusterids_vec,
+                                         min.cells.gexp = 10) {
+  if (!all(clusterids_vec %in% colnames(metadata))) {
+    stop(".precompute_bootstrap_inputs: faltan columnas de clusterids_vec en metadata")
+  }
+  cellid_vec <- do.call(paste, c(metadata[, clusterids_vec, drop = FALSE], sep = "."))
+  names(cellid_vec) <- as.character(metadata$cell.id)
+  
+  nlevels <- length(clusterids_vec)
+  cell_ids_all <- as.character(metadata$cell.id)
+  
+  if (nlevels == 1) {
+    # split(cellid, as.factor(cellid)) en el original => agrupa por la
+    # combinación (que aquí solo es cell.type). Lo replicamos.
+    by_ct <- split(cell_ids_all, as.factor(cellid_vec))
+    # Estructura uniforme: ct -> "_NONE_" -> cell.ids (para reusar el código
+    # de la rama nlevels>=2). El consumidor sabrá que es nlevels==1 vía un flag.
+    groups_skeleton <- lapply(by_ct, function(ids) list("_NONE_" = ids))
+  } else {
+    # En el original se hace strsplit(cellid, "[.]")[[1]][1] y [2] para recuperar
+    # cell.type y tissue. Como ya tenemos las columnas en metadata, las usamos
+    # directamente (más rápido y libre del bug latente "punto en el nombre").
+    ct_vec <- as.character(metadata[[clusterids_vec[1]]])
+    ts_vec <- as.character(metadata[[clusterids_vec[2]]])
+    
+    # Orden alfabético de cell.types (== levels(as.factor(...)) == orden split())
+    ct_levels <- levels(as.factor(ct_vec))
+    groups_skeleton <- lapply(ct_levels, function(ct) {
+      idx_ct <- which(ct_vec == ct)
+      ts_sub <- ts_vec[idx_ct]
+      ids_sub <- cell_ids_all[idx_ct]
+      ts_levels <- levels(as.factor(ts_sub))
+      out <- lapply(ts_levels, function(ts) ids_sub[ts_sub == ts])
+      names(out) <- ts_levels
+      out
+    })
+    names(groups_skeleton) <- ct_levels
+  }
+  markers <- rownames(data_norm)
+  vals_by_marker <- vector("list", length(markers))
+  groups_by_marker <- vector("list", length(markers))
+  names(vals_by_marker) <- markers
+  names(groups_by_marker) <- markers
+  
+  for (m in markers) {
+    vals <- data_norm[m, ]
+    keep <- !is.na(vals) & vals > 0
+    vals <- vals[keep]
+    if (length(vals) < min.cells.gexp) {
+      # Equivalente a return(NULL) en el lapply original.
+      vals_by_marker[[m]] <- NULL
+      groups_by_marker[[m]] <- NULL
+      next
+    }
+    vals_by_marker[[m]] <- vals  # named vector
+    
+    # Replicar EXACTAMENTE el intersect(names(cells_dat), names(a)) original:
+    # el primer argumento manda el orden -> usar names(vals).
+    valid_ids <- names(vals)
+    valid_set <- structure(seq_along(valid_ids), names = valid_ids)  # lookup O(1)
+    
+    groups_by_marker[[m]] <- lapply(groups_skeleton, function(ct_list) {
+      lapply(ct_list, function(ids_in_group) {
+        # Equivalente a intersect(names(vals), ids_in_group) preservando
+        # orden de names(vals). match() devuelve NA en los no presentes;
+        # ordenamos por la posición en valid_ids para replicar el orden.
+        pos <- valid_set[ids_in_group]
+        pos <- pos[!is.na(pos)]
+        if (length(pos) == 0) return(character(0))
+        valid_ids[sort(unname(pos))]
+      })
+    })
+  }
+  
+  list(
+    nlevels          = nlevels,
+    cellid_vec       = cellid_vec,
+    markers          = markers,
+    vals_by_marker   = vals_by_marker,
+    groups_by_marker = groups_by_marker
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# .sample_data_fast
+# Replica la lógica de sample.data() pero opera sobre las estructuras
+# pre-computadas en .precompute_bootstrap_inputs(). full_lengths_for_marker
+# guarda los tamaños de cada grupo ANTES del intersect con valid_ids, igual
+# que length(x) / length(set.tissue) en el original.
+# -----------------------------------------------------------------------------
+.sample_data_fast <- function(vals, groups_for_marker, full_lengths_for_marker,
+                              ncells.sample, nlevels) {
+  if (nlevels == 1) {
+    # set <- split(cellid, as.factor(cellid))
+    # En nuestra estructura nlevels==1, groups_for_marker[[ct]][["_NONE_"]] son
+    # los cell.ids válidos; full_lengths_for_marker[[ct]][["_NONE_"]] es
+    # length(x) (la partición completa antes del intersect).
+    set_cells <- unlist(lapply(names(groups_for_marker), function(ct) {
+      pick   <- groups_for_marker[[ct]][["_NONE_"]]
+      x_len  <- full_lengths_for_marker[[ct]][["_NONE_"]]
+      if (length(pick) >= 1 && x_len >= 50) {
+        sample(x = pick, size = ncells.sample, replace = TRUE)
+      } else {
+        NA_character_
+      }
+    }))
+  } else {
+    # nlevels >= 2: replica la lógica del original paso a paso.
+    set_cells <- unlist(lapply(names(groups_for_marker), function(ct) {
+      ts_list   <- groups_for_marker[[ct]]              # ts -> picktis
+      ts_full_l <- full_lengths_for_marker[[ct]]        # ts -> length completa
+      ts_names  <- names(ts_list)                       # ya en orden alfabético
+      
+      # n calculado con length(set.tissue) ANTES del filtro.
+      n_total_tissues <- length(ts_names)
+      if (n_total_tissues == 0) return(NA_character_)
+      n <- round(ncells.sample / n_total_tissues)
+      
+      # Filtrar tissues con length(a) >= n (length DEL GRUPO COMPLETO, no de picktis)
+      keep_ts <- ts_names[vapply(ts_names,
+                                 function(ts) ts_full_l[[ts]] >= n,
+                                 logical(1))]
+      if (length(keep_ts) == 0) return(NA_character_)
+      
+      # sn recalculado con set.tissue post-filtro (puede diferir de n).
+      sn <- round(ncells.sample / length(keep_ts))
+      
+      # Loop por tissues en el MISMO ORDEN que el split() original (alfabético).
+      set_cells_tis <- unlist(lapply(keep_ts, function(ts) {
+        picktis <- ts_list[[ts]]
+        a_full_len <- ts_full_l[[ts]]
+        if (length(picktis) >= 1 && a_full_len >= sn) {
+          sample(x = picktis, size = sn, replace = TRUE)
+        } else {
+          NA_character_
+        }
+      }))
+      
+      set_cells_tis <- set_cells_tis[!is.na(set_cells_tis)]
+      if (length(set_cells_tis) >= 50) {
+        # Sample() final de ajuste a ncells.sample (idéntico al original).
+        if (length(set_cells_tis) != ncells.sample) {
+          set_cells_tis <- sample(x = set_cells_tis, size = ncells.sample, replace = TRUE)
+        }
+        set_cells_tis
+      } else {
+        NA_character_
+      }
+    }))
+  }
+  
+  if (is.null(length(set_cells))) return(NULL)
+  set_cells <- set_cells[!is.na(set_cells)]
+  if (length(set_cells) == 0) return(NULL)
+  x <- vals[set_cells]
+  names(x) <- set_cells
+  x
+}
+
+
+# -----------------------------------------------------------------------------
+# .Background_sampling_fast
+# -----------------------------------------------------------------------------
+
+.Background_sampling_fast <- function(precomp, ncells.sample) {
+  markers <- precomp$markers
+  nlevels <- precomp$nlevels
+  
+  ids_samples_byGene <- vector("list", length(markers))
+  names(ids_samples_byGene) <- markers
+  
+  for (m in markers) {
+    vals <- precomp$vals_by_marker[[m]]
+    if (is.null(vals)) {
+      ids_samples_byGene[[m]] <- NULL
+      next
+    }
+    ids_samples_byGene[[m]] <- .sample_data_fast(
+      vals                     = vals,
+      groups_for_marker        = precomp$groups_by_marker[[m]],
+      full_lengths_for_marker  = precomp$full_lengths_by_marker[[m]],
+      ncells.sample            = ncells.sample,
+      nlevels                  = nlevels
+    )
+  }
+  
+  # Mismo postproceso que el original:
+  ids_samples_byGene <- ids_samples_byGene[!sapply(ids_samples_byGene, is.null)]
+  ids_samples_byGene
+}
+
+
+# -----------------------------------------------------------------------------
+# .RunBackComputations_fast
+# -----------------------------------------------------------------------------
+
+.RunBackComputations_fast <- function(precomp, ncells.sample, file.id) {
+  sampled.back <- .Background_sampling_fast(precomp, ncells.sample)
+  GetThresholds(processed.back = sampled.back, file.id = file.id)
+}
+
+# -----------------------------------------------------------------------------
+# .SampleBackground_pooled  (T-7.2)
+#
+# Unstratified per-marker bootstrap sampler. Mirrors the SampleBackground()
+# function shipped in the CITE-seq pipeline before Hito 2 T-3
+# (codebase/internalFunctions.R lines 2018-2040 at commit 56d3fd9), which
+# in turn mirrors the active path of the scGeneXpress reference
+# implementation (`internalFunctions.R:338-345` of scGeneXpress-main):
+# for each marker, draw `ncells.sample` values with replacement from the
+# pool of finite values across all cells. `clusterids_vec` is intentionally
+# absent here -- this branch does not stratify.
+#
+# Used by RunBootstrap() when bootstrap_stratify == "none".
+# -----------------------------------------------------------------------------
+.SampleBackground_pooled <- function(norm.data, ncells.sample) {
+  mat <- as.matrix(norm.data)
+  markers <- rownames(mat)
+  out <- lapply(seq_len(nrow(mat)), function(i) {
+    vals <- mat[i, ]
+    vals <- vals[is.finite(vals)]
+    if (length(vals) == 0L) return(numeric(0))
+    sample(vals, ncells.sample, replace = TRUE)
+  })
+  names(out) <- markers
+  out
+}
+
+.RunBackComputations_pooled <- function(norm.data, ncells.sample, file.id) {
+  sampled.back <- .SampleBackground_pooled(norm.data, ncells.sample)
+  GetThresholds(processed.back = sampled.back, file.id = file.id)
+}
+# -----------------------------------------------------------------------------
+# RunBootstrap (versión optimizada)
+# -----------------------------------------------------------------------------
+#' Bootstrap per-marker threshold distributions
+#'
+#' Two-mode bootstrap. `bootstrap_stratify == "none"` (default since T-7)
+#' samples each marker from the global pool of finite values across cells
+#' with replacement, matching the scGeneXpress active path. The
+#' `"cell.type"` and `"cell.type_tissue"` modes stratify by the matching
+#' metadata columns using a one-shot precompute + per-iteration
+#' `.RunBackComputations_fast()`. Either path is run inside
+#' `foreach %dopar%` (fork on Unix, PSOCK on Windows) with BLAS/OMP/MKL
+#' pinned to 1 thread per worker.
+#'
+#' @param data_norm proteins x cells normalised matrix.
+#' @param dir_name Output directory.
+#' @param file.id character(1) used as filename prefix.
+#' @param clusterids_vec metadata columns to stratify by. Ignored when
+#'   `bootstrap_stratify == "none"`.
+#' @param metadata data.frame; must contain `cell.id` and `clusterids_vec`.
+#' @param sample_n integer. Cells per bootstrap sample.
+#' @param parallelize logical.
+#' @param ncores integer. Honours SLURM_CPUS_PER_TASK.
+#' @param num.boot.sample integer.
+#' @param fixseed integer.
+#' @param bootstrap_stratify one of "none" (default), "cell.type",
+#'   "cell.type_tissue". Selects the sampling strategy.
+#' @return list keyed by marker, each `n_boot x 2 (Lower, Upper)`.
+#' @export
+RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
+                         sample_n, parallelize, ncores, num.boot.sample, fixseed,
+                         bootstrap_stratify = c("none", "cell.type", "cell.type_tissue")){
+  bootstrap_stratify <- match.arg(bootstrap_stratify)
+  data_norm <- .as_dense_matrix(data_norm)
+  set.seed(fixseed)
+  cl <- NULL
+  
+  # --- Resolución robusta de ncores cross-platform / cross-scheduler ---------
+  resolve_ncores <- function(ncores_req, n_tasks) {
+    slurm_cpus <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK",
+                                                         unset = NA)))
+    base_n <- if (is.numeric(ncores_req) && length(ncores_req) == 1L &&
+                  !is.na(ncores_req) && ncores_req >= 1L) {
+      as.integer(ncores_req)
+    } else if (!is.na(slurm_cpus) && slurm_cpus >= 1L) {
+      slurm_cpus
+    } else {
+      max(1L, parallel::detectCores() - 1L)
+    }
+    if (!is.na(slurm_cpus) && slurm_cpus >= 1L) {
+      base_n <- min(base_n, slurm_cpus)
+    }
+    min(base_n, as.integer(n_tasks))
+  }
+  
+  effective_ncores <- resolve_ncores(ncores, num.boot.sample)
+  use_parallel <- isTRUE(parallelize) && effective_ncores >= 2L && num.boot.sample >= 2L
+  
+  # --- Fijar BLAS/OMP/MKL a 1 hilo (padre y workers) -------------------------
+  .prev_blas_threads <- NA_integer_
+  .prev_omp_threads  <- Sys.getenv("OMP_NUM_THREADS",      unset = NA)
+  .prev_mkl_threads  <- Sys.getenv("MKL_NUM_THREADS",      unset = NA)
+  .prev_openblas_t   <- Sys.getenv("OPENBLAS_NUM_THREADS", unset = NA)
+  
+  if (use_parallel) {
+    if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+      .prev_blas_threads <- tryCatch(RhpcBLASctl::blas_get_num_procs(),
+                                     error = function(e) NA_integer_)
+      try(RhpcBLASctl::blas_set_num_threads(1L), silent = TRUE)
+      try(RhpcBLASctl::omp_set_num_threads(1L),  silent = TRUE)
+    }
+    Sys.setenv(OMP_NUM_THREADS      = "1")
+    Sys.setenv(MKL_NUM_THREADS      = "1")
+    Sys.setenv(OPENBLAS_NUM_THREADS = "1")
+  }
+  
+  # --- PRECOMPUTACIÓN: solo en ramas estratificadas (T-7.3) -------------------
+  # bootstrap_stratify == "none" pesa sobre `data_norm` directamente (pool
+  # global por marker), así que no hay nada que precomputar y `data_norm`
+  # debe seguir vivo cuando entremos al foreach.
+  precomp <- NULL
+  if (bootstrap_stratify != "none") {
+  t_pre <- proc.time()
+  precomp <- .precompute_bootstrap_inputs(
+    data_norm      = data_norm,
+    metadata       = metadata,
+    clusterids_vec = clusterids_vec,
+    min.cells.gexp = 10
+  )
+
+  build_full_lengths <- function(metadata, clusterids_vec, markers, nlevels) {
+    if (nlevels == 1) {
+      cellid_vec <- do.call(paste, c(metadata[, clusterids_vec, drop = FALSE], sep = "."))
+      # length(x) en sample.data nlevels==1: el split por cellid agrupa todas
+      # las células con ese cellid; length(x) es ese conteo.
+      tab <- table(cellid_vec)
+      ct_levels <- names(tab)
+      lens_one <- lapply(ct_levels, function(ct) list("_NONE_" = as.integer(tab[[ct]])))
+      names(lens_one) <- ct_levels
+      # Es independiente del marcador, así que replicamos la misma lista por
+      # cada marcador para mantener la interfaz uniforme.
+      out <- vector("list", length(markers))
+      names(out) <- markers
+      for (m in markers) out[[m]] <- lens_one
+      return(out)
+    }
+    ct_vec <- as.character(metadata[[clusterids_vec[1]]])
+    ts_vec <- as.character(metadata[[clusterids_vec[2]]])
+    ct_levels <- levels(as.factor(ct_vec))
+    lens_skeleton <- lapply(ct_levels, function(ct) {
+      idx_ct <- which(ct_vec == ct)
+      ts_sub <- ts_vec[idx_ct]
+      ts_levels <- levels(as.factor(ts_sub))
+      tab <- table(factor(ts_sub, levels = ts_levels))
+      out <- as.list(as.integer(tab))
+      names(out) <- ts_levels
+      out
+    })
+    names(lens_skeleton) <- ct_levels
+    # length(set.tissue) en el original es independiente del marcador
+    # (es la partición de la metadata completa por ct, ts).
+    out <- vector("list", length(markers))
+    names(out) <- markers
+    for (m in markers) out[[m]] <- lens_skeleton
+    out
+  }
+  precomp$full_lengths_by_marker <- build_full_lengths(
+    metadata = metadata,
+    clusterids_vec = clusterids_vec,
+    markers = precomp$markers,
+    nlevels = precomp$nlevels
+  )
+  message(sprintf("[TIMING][bootstrap] precompute elapsed: %.2fs",
+                  (proc.time() - t_pre)[["elapsed"]]))
+  rm(data_norm); invisible(gc(verbose = FALSE))
+  }  # end if (bootstrap_stratify != "none")
+  
+  # --- Crear cluster: fork en Unix, PSOCK en Windows -------------------------
+  if (use_parallel) {
+    try(unregister_dopar(), silent = TRUE)
+    cl <- tryCatch({
+      if (.Platform$OS.type == "unix") {
+        parallel::makeForkCluster(nnodes = effective_ncores)
+      } else {
+        parallel::makePSOCKcluster(effective_ncores)
+      }
+    }, error = function(e) {
+      message("[parallel][RunBootstrap] No se pudo crear cluster (",
+              conditionMessage(e), "); cayendo a secuencial.")
+      NULL
+    })
+    
+    if (!is.null(cl)) {
+      doParallel::registerDoParallel(cl)
+      if (.Platform$OS.type != "unix") {
+        try(parallel::clusterEvalQ(cl, {
+          Sys.setenv(OMP_NUM_THREADS      = "1",
+                     MKL_NUM_THREADS      = "1",
+                     OPENBLAS_NUM_THREADS = "1")
+          if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+            try(RhpcBLASctl::blas_set_num_threads(1L), silent = TRUE)
+            try(RhpcBLASctl::omp_set_num_threads(1L),  silent = TRUE)
+          }
+        }), silent = TRUE)
+      }
+    }
+  }
+  
+  n_markers_msg <- if (is.null(precomp)) nrow(data_norm) else length(precomp$markers)
+  if (use_parallel && !is.null(cl)) {
+    message(sprintf("[PARALLEL][bootstrap] Cluster creado: %d workers (%s) para %d iteraciones (%d marcadores por iteración, stratify=%s).",
+                    effective_ncores,
+                    if (.Platform$OS.type == "unix") "fork" else "PSOCK",
+                    num.boot.sample,
+                    n_markers_msg,
+                    bootstrap_stratify))
+  } else {
+    message(sprintf("[PARALLEL][bootstrap] Ejecución SECUENCIAL (ncores_solicitado=%s, effective=%d, parallelize=%s, stratify=%s).",
+                    as.character(ncores), effective_ncores,
+                    as.character(parallelize), bootstrap_stratify))
+  }
+  
+  on.exit({
+    if (!is.null(cl)) {
+      try(parallel::stopCluster(cl), silent = TRUE)
+      try(foreach::registerDoSEQ(), silent = TRUE)
+      try(unregister_dopar(), silent = TRUE)
+    }
+    if (!is.na(.prev_blas_threads) && requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+      try(RhpcBLASctl::blas_set_num_threads(.prev_blas_threads), silent = TRUE)
+    }
+    if (is.na(.prev_omp_threads)) Sys.unsetenv("OMP_NUM_THREADS")      else Sys.setenv(OMP_NUM_THREADS      = .prev_omp_threads)
+    if (is.na(.prev_mkl_threads)) Sys.unsetenv("MKL_NUM_THREADS")      else Sys.setenv(MKL_NUM_THREADS      = .prev_mkl_threads)
+    if (is.na(.prev_openblas_t))  Sys.unsetenv("OPENBLAS_NUM_THREADS") else Sys.setenv(OPENBLAS_NUM_THREADS = .prev_openblas_t)
+  }, add = TRUE)
+  
+  # --- Bucle principal -------------------------------------------------------
+  `%OP%` <- if (use_parallel && !is.null(cl)) foreach::`%dopar%` else foreach::`%do%`
+  
+  t_boot <- proc.time()
+  th_list <- foreach::foreach(
+    n = 1:num.boot.sample,
+    .packages = c("Matrix"),
+    .export   = c(".sample_data_fast", ".Background_sampling_fast",
+                  ".RunBackComputations_fast",
+                  ".SampleBackground_pooled", ".RunBackComputations_pooled",
+                  ".optLowFun", ".optHighFun",
+                  "minimizeRectangle", "createThresholdDist", "swap_th",
+                  "GetThresholds")
+  ) %OP% {
+    if (bootstrap_stratify == "none") {
+      .RunBackComputations_pooled(data_norm, sample_n, file.id)
+    } else {
+      .RunBackComputations_fast(precomp, sample_n, file.id)
+    }
+  }
+  message(sprintf("[TIMING][bootstrap] foreach elapsed: %.2fs",
+                  (proc.time() - t_boot)[["elapsed"]]))
+  
+  # --- Post-proceso idéntico al original -------------------------------------
+  ng <- length(th_list[[1]])
+  thrs_list <- lapply(seq_len(ng), function(i){
+    gthrs <- do.call("rbind", lapply(th_list, function(a) a[[i]]))
+    colnames(gthrs) <- c("Lower", "Upper")
+    gthrs
+  })
+  names(thrs_list) <- names(th_list[[1]])
+  
+  if (!is.null(cl)) {
+    try(parallel::stopCluster(cl), silent = TRUE)
+    try(foreach::registerDoSEQ(), silent = TRUE)
+    try(unregister_dopar(), silent = TRUE)
+    cl <- NULL
+  }
+  
+  thrs_list
+}
+
+#' Build the reference background threshold distributions
+#'
+#' Writes `<file.id>_sf.txt` (unit scaling factors) and `<file.id>_th_dist.rds`
+#' (per-marker bootstrap thresholds) under `dir_name`.
+#'
+#' @param data_norm proteins x cells normalised matrix.
+#' @param dir_name,file.id Output paths.
+#' @param metadata data.frame.
+#' @param sample_n,parallelize,ncores,num.boot.sample,fixseed Bootstrap controls.
+#' @param bootstrap_stratify one of "none" (default), "cell.type",
+#'   "cell.type_tissue". See `run_scProteinXpress()` for semantics.
+#'   `"cell.type_tissue"` requires a `tissue` column in `metadata`;
+#'   falls back to `"cell.type"` with a warning otherwise.
+#' @return list of per-marker threshold matrices.
+#' @export
+GetBackground <- function(data_norm, dir_name, file.id, metadata, sample_n, parallelize, ncores, num.boot.sample, fixseed,
+                          bootstrap_stratify = c("none", "cell.type", "cell.type_tissue")){
+  bootstrap_stratify <- match.arg(bootstrap_stratify)
+  data_norm <- .as_dense_matrix(data_norm)
+
+  ## T-7.4: resolución explícita de `clusterids_vec` a partir de
+  ## `bootstrap_stratify`. Reemplaza la heurística previa
+  ## (presencia/ausencia de `tissue`) por una decisión guiada por el
+  ## usuario.
+  if (identical(bootstrap_stratify, "cell.type_tissue") &&
+      !all(c("cell.type", "tissue") %in% colnames(metadata))) {
+    warning("GetBackground: requested cell.type_tissue stratification but ",
+            "tissue column not present; falling back to cell.type.",
+            call. = FALSE)
+    bootstrap_stratify <- "cell.type"
+  }
+  clusterids_vec <- switch(bootstrap_stratify,
+    "none"             = character(0),
+    "cell.type"        = "cell.type",
+    "cell.type_tissue" = c("cell.type", "tissue")
+  )
+  dir.create(dir_name, recursive = TRUE, showWarnings = FALSE)
+
+  feats <- rownames(data_norm)
+  sf_vec <- rep(1, length(feats))
+  names(sf_vec) <- feats
+  utils::write.table(data.frame(feature = feats, sf = sf_vec), file = file.path(dir_name, paste0(file.id, "_sf.txt")), sep = " ", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+  back.thrs <- RunBootstrap(data_norm, dir_name, file.id, clusterids_vec, metadata, sample_n, parallelize, ncores, num.boot.sample, fixseed,
+                            bootstrap_stratify = bootstrap_stratify)
+  saveRDS(back.thrs, file.path(dir_name, paste0(file.id, "_th_dist.rds")))
+  back.thrs
+}
+
+compute_pval <- function(th_list, gexp_mat, genes, p_correct = TRUE){
+  p_vals <- foreach::foreach(n = seq_along(genes)) %do% {
+    g <- genes[n]
+    p_exp  <- 1 - (ecdf(th_list[[g]][,"Upper"])(gexp_mat[g, ]))
+    p_nexp <-      ecdf(th_list[[g]][,"Lower"])(gexp_mat[g, ])
+    list(p_vals_exp = p_exp, p_vals_nexp = p_nexp)
+  }
+  
+  if (p_correct) {
+    sig_vals <- lapply(p_vals, function(x) list(sig_exp = stats::p.adjust(x$p_vals_exp, method = "BH"), sig_nexp = stats::p.adjust(x$p_vals_nexp, method = "BH")))
+  } else {
+    sig_vals <- lapply(p_vals, function(x) list(sig_exp = x$p_vals_exp, sig_nexp = x$p_vals_nexp))
+  }
+  
+  names(sig_vals) <- genes
+  sig_exp  <- do.call("rbind", lapply(sig_vals, `[[`, "sig_exp"))
+  sig_nexp <- do.call("rbind", lapply(sig_vals, `[[`, "sig_nexp"))
+  colnames(sig_exp)  <- colnames(gexp_mat)
+  colnames(sig_nexp) <- colnames(gexp_mat)
+  list(sig_exp = sig_exp, sig_nexp = sig_nexp)
+}
+
+classify <- function(sig_vals, th, th_i){
+  sig_exp <- sig_vals[["sig_exp"]]
+  sig_nexp <- sig_vals[["sig_nexp"]]
+  discrete_exp <- matrix(0, nrow = nrow(sig_exp), ncol = ncol(sig_exp))
+  rownames(discrete_exp) <- rownames(sig_exp)
+  colnames(discrete_exp) <- colnames(sig_exp)
+  cond_05 <- (sig_nexp > (1 - th_i)) & (sig_exp > th_i)
+  discrete_exp[cond_05] <- 0.5
+  cond_0 <- (sig_nexp <= th)
+  discrete_exp[cond_0] <- 0
+  cond_1 <- (sig_exp <= th)
+  discrete_exp[cond_1] <- 1
+  cond_na <- is.na(sig_exp) | is.na(sig_nexp)
+  discrete_exp[cond_na] <- NA_real_
+  return(discrete_exp)
+}
+
+#' Discretise a scaled query matrix against reference thresholds
+#'
+#' Computes per-cell p-values against the bootstrap-derived ECDFs and
+#' classifies each cell to {0, 0.5, 1, NA} at the configured `th` / `th_i`.
+#'
+#' @param query_ScaledData proteins x cells matrix.
+#' @param Ref_data Path to the reference directory.
+#' @param thsback Optional pre-loaded threshold list.
+#' @param th Numeric. Significance threshold for 0/1.
+#' @param th_i Numeric. Significance threshold for the 0.5 intermediate.
+#' @param file.id character(1) used as filename prefix.
+#' @param outdir Output directory.
+#' @param return.data,saveData logical switches.
+#' @return list(discretised_data, significance).
+#' @export
+Discretise_data <- function(query_ScaledData, Ref_data, thsback = NA, th = 0.05, th_i = 0.05, file.id = "myquery", outdir = ".", return.data = TRUE, saveData = TRUE){
+  dir_name <- file.path(outdir, paste0("Query_", file.id))
+  if (!dir.exists(dir_name)) dir.create(dir_name, recursive = TRUE)
+  threshold.dist <- if (length(thsback) == 1) {
+    ## T-5: explicit guard around the implicit `_th_dist.rds` resolution.
+    f <- list.files(Ref_data, pattern = "_th_dist\\.rds$", full.names = TRUE)
+    if (length(f) != 1L) {
+      stop(sprintf("Discretise_data: expected exactly one *_th_dist.rds in %s; found %d.",
+                   Ref_data, length(f)))
+    }
+    readRDS(f[1])
+  } else thsback
+  if (!is.list(threshold.dist) || length(threshold.dist) == 0L) {
+    stop("Discretise_data: threshold distribution list is empty or malformed.")
+  }
+  genes_common <- intersect(rownames(query_ScaledData), names(threshold.dist))
+  if (length(genes_common) == 0L) {
+    stop(sprintf(
+      "Discretise_data: no markers shared between query (n=%d) and threshold distributions (n=%d).",
+      nrow(query_ScaledData), length(threshold.dist)))
+  }
+  query_pvals <- compute_pval(threshold.dist, query_ScaledData, genes_common, FALSE)
+  saveRDS(query_pvals, file = file.path(dir_name, paste0(file.id, "_pvals.rds")))
+  query_discretised <- classify(query_pvals, th, th_i)
+  data <- list(discretised_data = query_discretised, significance = query_pvals)
+  if (saveData) saveRDS(data, file = file.path(dir_name, paste0(file.id, "_DiscretisedData.rds")))
+  if (return.data) return(data)
+  invisible(NULL)
+}
+#' Per-gene signature frame with Mode C coverage filter
+#'
+#' Returns a 5-element list:
+#' \enumerate{
+#'   \item sig.frame data.frame (gene, n.0, n.0.5, n.1, not.0, not.0.perc,
+#'         pct_one, coverage_fraction, n_observed).
+#'   \item z2 (legacy z-score retained for back-compat).
+#'   \item prob_low (per-pop binomial baseline for the non-zero rate).
+#'   \item prob_high (per-pop binomial baseline for 0.5 among non-zero).
+#'   \item excluded_genes character vector of genes excluded from the
+#'         prob_low / prob_high computation by the coverage filter.
+#' }
+#'
+#' @param discrete.mat proteins x cells discretised matrix.
+#' @param min.coverage.fraction.sigframe Numeric in [0, 1].
+#' @param audit_csv_path Optional path; writes the excluded-from-baseline
+#'   gene table when set.
+#' @return list of length 5 (see Description).
+#' @noRd
+Create.sig.frame <- function(discrete.mat,
+                             min.coverage.fraction.sigframe = 0.10,
+                             audit_csv_path = NULL){
+  ## T-5: argument sanity. `discrete.mat` must be a 0/0.5/1/NA matrix with
+  ## rownames (markers). Anything else is a programming error upstream.
+  if (!is.matrix(discrete.mat) && !inherits(discrete.mat, "Matrix")) {
+    stop("Create.sig.frame: discrete.mat must be a matrix; got ",
+         paste(class(discrete.mat), collapse = ","))
+  }
+  if (is.null(rownames(discrete.mat))) {
+    stop("Create.sig.frame: discrete.mat must have rownames (marker names).")
+  }
+  if (!is.numeric(min.coverage.fraction.sigframe) ||
+      min.coverage.fraction.sigframe < 0 ||
+      min.coverage.fraction.sigframe > 1) {
+    stop("Create.sig.frame: min.coverage.fraction.sigframe must be in [0, 1].")
+  }
+  # Build a per-gene summary of a discretised matrix and pre-compute the
+  # population-wide binomial probabilities used by discrete.expr.levels().
+  #
+  # Output contract (list):
+  #   [[1]] sig.frame      enriched per-gene table
+  #   [[2]] z2             legacy z-score (kept for API back-compat)
+  #   [[3]] prob_low       binomial baseline for "non-zero rate"
+  #   [[4]] prob_high      binomial baseline for "0.5 rate among non-zero"
+  #   [[5]] excluded_genes character vector of genes excluded from prob_low/high
+  #
+  # Methodology (Mode C / Option C):
+  #   - prob_low / prob_high are computed ONLY over genes whose per-population
+  #     coverage (n_observed / n_cells_in_pop) is >= min.coverage.fraction.sigframe.
+  #     This protects the population-level baseline from being contaminated by
+  #     markers that are technically present in the matrix (they passed the
+  #     global QC of P2) but happen to have very few observations in this
+  #     specific population due to multi-panel NA padding.
+  #   - Every gene STILL receives its own call in discrete.expr.levels() against
+  #     these sanitised probs, including those excluded from the prob calc.
+  #     Excluded-from-baseline does NOT mean excluded-from-output.
+  #
+  # Schema of sig.frame (columns):
+  #   gene, n.0, n.0.5, n.1, not.0, not.0.perc, pct_one,
+  #   coverage_fraction, n_observed
+  # (expr.level is added later by discrete.expr.levels).
+
+  discrete.mat[is.nan(discrete.mat)] <- NA
+  n_cells_pop <- ncol(discrete.mat)
+  if (n_cells_pop == 0L) {
+    return(list(data.frame(), 0, 1e-6, 1e-6, character(0)))
+  }
+
+  # Per-gene vectorised counts (single matrix scan per category)
+  m0   <- discrete.mat == 0
+  m05  <- discrete.mat == 0.5
+  m1   <- discrete.mat == 1
+  n0   <- rowSums(m0,  na.rm = TRUE)
+  n05  <- rowSums(m05, na.rm = TRUE)
+  n1   <- rowSums(m1,  na.rm = TRUE)
+  n_observed <- n0 + n05 + n1
+
+  keep_gene <- n_observed > 0L
+  if (!any(keep_gene)) return(list(data.frame(), 0, 1e-6, 1e-6, character(0)))
+
+  not0  <- (n05 + n1)[keep_gene]
+  not0p <- not0 / n_observed[keep_gene]
+  pct_one <- n1[keep_gene] / pmax(n_observed[keep_gene], 1L)
+  coverage_fraction <- n_observed[keep_gene] / n_cells_pop
+
+  sig.frame <- data.frame(
+    gene              = rownames(discrete.mat)[keep_gene],
+    n.0               = n0[keep_gene],
+    n.0.5             = n05[keep_gene],
+    n.1               = n1[keep_gene],
+    not.0             = not0,
+    not.0.perc        = not0p,
+    pct_one           = pct_one,
+    coverage_fraction = coverage_fraction,
+    n_observed        = n_observed[keep_gene],
+    stringsAsFactors  = FALSE
+  )
+  rownames(sig.frame) <- sig.frame$gene
+  sig.frame <- sig.frame[order(sig.frame$not.0.perc, decreasing = TRUE), , drop = FALSE]
+
+  # Legacy z-score statistic (kept for back-compat with previous outputs/plots).
+  p_global <- sum(discrete.mat > 0, na.rm = TRUE) /
+              (nrow(discrete.mat) * ncol(discrete.mat))
+  z2 <- (sqrt(n_cells_pop * p_global * (1 - p_global)) * 2) + (n_cells_pop * p_global)
+
+  # Per-population coverage filter: keep only genes with sufficient coverage
+  # to contribute to the binomial baseline.
+  # NOTE: sig.frame has been reordered by not.0.perc above, so we must derive
+  # passes_cov from the reordered sig.frame$coverage_fraction (NOT from the
+  # pre-reorder vector, which would be misaligned with sig.frame$gene).
+  passes_cov <- sig.frame$coverage_fraction >= min.coverage.fraction.sigframe
+  excluded_genes <- sig.frame$gene[!passes_cov]
+  used_genes     <- sig.frame$gene[ passes_cov]
+
+  if (length(used_genes) == 0L) {
+    warning(sprintf(
+      "[Create.sig.frame] No genes meet min.coverage.fraction.sigframe=%.2f in this population (n_cells_pop=%d). %s",
+      min.coverage.fraction.sigframe, n_cells_pop,
+      "Falling back to all genes for the binomial baseline."))
+    used_idx <- rep(TRUE, nrow(sig.frame))
+  } else {
+    used_idx <- passes_cov
+  }
+
+  # Recompute prob_low / prob_high on the subset of trustworthy genes only.
+  # We sum the per-gene counts of those genes (this equals scanning the
+  # discrete matrix restricted to those gene rows and all their non-NA cells).
+  N0_sub  <- sum(sig.frame$n.0[used_idx])
+  N05_sub <- sum(sig.frame$n.0.5[used_idx])
+  N1_sub  <- sum(sig.frame$n.1[used_idx])
+  Nnz_sub <- N05_sub + N1_sub
+  Nall_sub <- N0_sub + Nnz_sub
+
+  prob_low  <- if (Nall_sub > 0) Nnz_sub / Nall_sub else 1e-6
+  prob_high <- if (Nnz_sub  > 0) N05_sub / Nnz_sub  else 1e-6
+  if (prob_low  >= 1) prob_low  <- 1 - 1e-6
+  if (prob_high >= 1) prob_high <- 1 - 1e-6
+  if (prob_low  <= 0) prob_low  <- 1e-6
+  if (prob_high <= 0) prob_high <- 1e-6
+
+  # Audit CSV: which genes were excluded from the prob_low/high computation
+  # in this population, with their coverage and counts.
+  if (length(excluded_genes) > 0L && !is.null(audit_csv_path)) {
+    audit <- sig.frame[!passes_cov,
+                       c("gene", "n_observed", "coverage_fraction",
+                         "n.0", "n.0.5", "n.1"),
+                       drop = FALSE]
+    audit$min.coverage.fraction.sigframe <- min.coverage.fraction.sigframe
+    audit$n_cells_in_population <- n_cells_pop
+    rownames(audit) <- NULL
+    tryCatch({
+      dir.create(dirname(audit_csv_path), showWarnings = FALSE, recursive = TRUE)
+      utils::write.csv(audit, audit_csv_path, row.names = FALSE)
+      message(sprintf(
+        "[Create.sig.frame] %d/%d genes excluded from prob_low/high baseline (coverage<%.2f). Audit: %s",
+        length(excluded_genes), nrow(sig.frame),
+        min.coverage.fraction.sigframe, audit_csv_path))
+    }, error = function(e) {
+      warning(sprintf("Could not write sig_frame audit CSV: %s", conditionMessage(e)))
+    })
+  } else if (length(excluded_genes) > 0L) {
+    message(sprintf(
+      "[Create.sig.frame] %d/%d genes excluded from prob_low/high baseline (coverage<%.2f).",
+      length(excluded_genes), nrow(sig.frame), min.coverage.fraction.sigframe))
+  }
+
+  list(sig.frame, z2, prob_low, prob_high, excluded_genes)
+}
+#' Assign per-gene expression levels with two binomial tests
+#'
+#' Vectorised one-sided `pbinom` (alternative = "greater") on each gene's
+#' non-zero count versus the per-population baselines `prob_low` and
+#' `prob_high` from `Create.sig.frame()`. Returns "low", "medium", "high"
+#' or "not.significant" in a new `expr.level` column.
+#'
+#' Back-compat: `discrete.expr.levels(tbl, zs)` (2 arguments) still works
+#' but emits `.Deprecated`. `zs` is no longer used and is kept only for
+#' positional API stability; pass `prob_low` and `prob_high` explicitly
+#' (preferably from `Create.sig.frame()`) to silence the warning.
+#'
+#' @param tbl data.frame returned by `Create.sig.frame()` (element 1).
+#' @param zs Legacy z-score, ignored.
+#' @param prob_low,prob_high Numerics; per-population binomial baselines.
+#' @return The input data.frame with an added `expr.level` column.
+#' @noRd
+discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL){
+  # Per-gene call using two binomial tests:
+  #   bt_low : P(non-zero >= n_nz | n_total, prob_low),  alternative="greater"
+  #            -> rejects "low" if the gene has more non-zero cells than expected.
+  #   bt_high: P(0.5 >= n_05 | n_nz, prob_high),         alternative="greater"
+  #            -> rejects "high" if among non-zero cells most are intermediate.
+  # Uses the population-level prob_low/prob_high supplied by Create.sig.frame
+  # (computed only on genes with sufficient per-population coverage). When not
+  # supplied, recovers them from the table itself for backward compatibility.
+
+  if (nrow(tbl) == 0) { tbl$expr.level <- character(0); return(tbl) }
+
+  if (is.null(prob_low) || is.null(prob_high)){
+    N0  <- sum(tbl$n.0)
+    N05 <- sum(tbl$n.0.5)
+    N1  <- sum(tbl$n.1)
+    Nnz <- N05 + N1
+    Nall <- N0 + Nnz
+    prob_low  <- if (Nall > 0) Nnz / Nall else 1e-6
+    prob_high <- if (Nnz  > 0) N05 / Nnz  else 1e-6
+  }
+  if (prob_low  >= 1) prob_low  <- 1 - 1e-6
+  if (prob_high >= 1) prob_high <- 1 - 1e-6
+  if (prob_low  <= 0) prob_low  <- 1e-6
+  if (prob_high <= 0) prob_high <- 1e-6
+
+  n05  <- as.numeric(tbl$n.0.5)
+  n1   <- as.numeric(tbl$n.1)
+  nnz  <- n05 + n1
+  ntot <- as.numeric(tbl$n.0) + nnz
+
+  # Vectorised one-sided binomial via pbinom:
+  # P(X >= k | n, p) = pbinom(k-1, n, p, lower.tail = FALSE).
+  p_low  <- pbinom(pmax(nnz - 1L, 0L), size = ntot, prob = prob_low,
+                   lower.tail = FALSE)
+  p_high <- ifelse(nnz > 0,
+                   pbinom(pmax(n05 - 1L, 0L), size = pmax(nnz, 1L),
+                          prob = prob_high, lower.tail = FALSE),
+                   NA_real_)
+
+  lvl <- character(length(nnz))
+  is_low <- (nnz == 0) | (p_low > 0.05)
+  lvl[is_low] <- "low"
+
+  rest <- !is_low
+  if (any(rest)){
+    tied <- rest & (n05 == n1)
+    lvl[tied] <- "not.significant"
+    rest2 <- rest & !tied
+    if (any(rest2)){
+      med <- rest2 & (p_high < 0.05)
+      lvl[med]            <- "medium"
+      lvl[rest2 & !med]   <- "high"
+    }
+  }
+
+  tbl$expr.level <- lvl
+  tbl
+}
