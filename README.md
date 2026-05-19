@@ -50,7 +50,7 @@ remotes::install_github("yezhengSTAT/ADTnorm")
 Then install `scProtXpress`:
 
 ```r
-remotes::install_github("YOURORG/scProtXpress")
+remotes::install_github("aitoe96/scProtXpress")
 ```
 
 Optional dependencies (only required for specific paths):
