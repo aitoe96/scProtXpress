@@ -1454,8 +1454,12 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 #' @param data.type "Ref" or "query".
 #' @param file.id character(1) used as filename prefix.
 #' @param bg.prot.pars list returned by Ref; ignored for Ref builds.
-#' @param saveData,return,outdir,sample_col,batch_col,marker_to_process
-#'   See `.ADTprot_norm_ref` / `.ADTprot_norm_query`.
+#' @param saveData logical; whether to save the normalised matrix to disk.
+#' @param return logical; whether to return the normalised matrix.
+#' @param outdir character(1); output directory for saved files.
+#' @param sample_col character(1); name of the metadata column holding sample ids.
+#' @param batch_col character(1); name of the metadata column holding batch ids.
+#' @param marker_to_process optional character vector; restrict normalisation to these markers.
 #' @param ... ADTnorm parameters (peak_type, multi_sample_per_batch, ...).
 #' @return Normalised proteins x cells matrix.
 #' @export
@@ -1698,7 +1702,7 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
 #'   with any non-NA measurement for a marker to be retained.
 #' @param audit_csv_path optional path. When set, exclusions are written here.
 #' @param qc_outlier_cells one of "no" (default), "yes". When "yes",
-#'   `.cell_outlier_filter()` is run before the marker-level filter. The
+#'   the internal cell-level outlier filter (scuttle::isOutlier on log10 total counts and detected markers) is applied before the marker-level filter. The
 #'   value "auto" is resolved upstream in `run_scProteinXpress()`.
 #' @return list(Counts, QCMetrics).
 #' @export
