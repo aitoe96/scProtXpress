@@ -26,8 +26,8 @@ data.frame to the unified API.
 2. **Mode C global QC.** A single `cleanData_ADT()` pass over the
    NA-padded union matrix with marker-level coverage filtering and an
    exclusion audit CSV.
-3. **Stratified bootstrap.** Per-marker threshold distributions
-   sampled stratified by `cell.type [x tissue]`, with
+3. **Bootstrap.** Per-marker threshold distributions
+   sampled, with
    SLURM_CPUS_PER_TASK-aware ncores and BLAS pinning.
 4. **Discretisation.** Each cell receives a {0, 0.5, 1, NA} label
    based on the ECDF of the reference bootstrap thresholds.
