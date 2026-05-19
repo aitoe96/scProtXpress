@@ -250,9 +250,9 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
 .ingest_citeseq <- function(data, metadata) {
   if (is.data.frame(data)) data <- as.matrix(data)
   if (is.matrix(data)) {
-    data <- as(Matrix::Matrix(data, sparse = TRUE), "dgCMatrix")
+    data <- methods::as(Matrix::Matrix(data, sparse = TRUE), "dgCMatrix")
   } else if (inherits(data, "Matrix") && !inherits(data, "dgCMatrix")) {
-    data <- as(data, "dgCMatrix")
+    data <- methods::as(data, "dgCMatrix")
   }
   if (!inherits(data, "dgCMatrix")) {
     stop(".ingest_citeseq: data must be matrix, Matrix, dgCMatrix, or data.frame; got ",
@@ -1460,7 +1460,34 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 #' @param sample_col character(1); name of the metadata column holding sample ids.
 #' @param batch_col character(1); name of the metadata column holding batch ids.
 #' @param marker_to_process optional character vector; restrict normalisation to these markers.
-#' @param ... ADTnorm parameters (peak_type, multi_sample_per_batch, ...).
+#' @param exclude_zeroes logical; ADTnorm parameter; passed through.
+#' @param bimodal_marker optional character vector; markers known to be bimodal.
+#' @param trimodal_marker optional character vector; markers known to be trimodal.
+#' @param positive_peak optional list; per-marker positive peak hints.
+#' @param bw_smallest_bi numeric; minimum bandwidth for bimodal markers.
+#' @param bw_smallest_tri numeric; minimum bandwidth for trimodal markers.
+#' @param bw_smallest_adjustments named list; per-marker bandwidth adjustments.
+#' @param quantile_clip numeric in the range 0 to 1; quantile used to clip extreme values.
+#' @param peak_type character; ADTnorm peak detection mode ("mode" or "midpoint").
+#' @param multi_sample_per_batch logical; whether multiple samples per batch are expected.
+#' @param shoulder_valley logical; enable shoulder-valley detection.
+#' @param shoulder_valley_slope numeric; slope threshold for shoulder detection.
+#' @param valley_density_adjust numeric; KDE bandwidth adjust for valley detection.
+#' @param landmark_align_type character; landmark alignment mode (e.g. "negPeak_valley_posPeak").
+#' @param midpoint_type character; midpoint definition (typically "valley").
+#' @param neg_candidate_thres optional numeric; threshold for the negative-peak candidate.
+#' @param lower_peak_thres numeric; lower bound for peak height to be considered.
+#' @param detect_outlier_valley logical; enable outlier-valley imputation.
+#' @param target_landmark_location optional named list; user-provided landmark targets.
+#' @param clean_adt_name logical; whether to sanitise ADT marker names.
+#' @param override_landmark optional named list; user overrides for specific landmarks.
+#' @param verbose logical; print progress messages.
+#' @param is_transformed logical or NULL; if NULL the input mode is auto-detected.
+#' @param sqs_threshold numeric; Stain Quality Score threshold (only used when apply_sqs is enabled).
+#' @param apply_sqs character; one of "none" (default), "ref_only", "both".
+#' @param do_subsample logical; apply hierarchical subsampling on the Ref branch.
+#' @param target_ct integer; cap of cells per cell type during Ref subsampling.
+#' @param ncores integer; number of cores for parallelisation.
 #' @return Normalised proteins x cells matrix.
 #' @export
 ADTprot_norm <- function(data_counts,
@@ -1698,7 +1725,7 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
 #' @param nmads number of MADs for the scuttle cell-outlier filter.
 #' @param min.cells.feature integer; minimum number of cells with a non-zero
 #'   non-NA value for a marker to be retained.
-#' @param min.coverage.fraction numeric in [0, 1]; minimum fraction of cells
+#' @param min.coverage.fraction numeric in the range 0 to 1; minimum fraction of cells
 #'   with any non-NA measurement for a marker to be retained.
 #' @param audit_csv_path optional path. When set, exclusions are written here.
 #' @param qc_outlier_cells one of "no" (default), "yes". When "yes",
@@ -1720,7 +1747,7 @@ cleanData_ADT <- function(data_counts, nmads = 3,
   }
   if (!is.numeric(min.coverage.fraction) ||
       min.coverage.fraction < 0 || min.coverage.fraction > 1) {
-    stop("cleanData_ADT: min.coverage.fraction must be in [0, 1]; got ", min.coverage.fraction)
+    stop("cleanData_ADT: min.coverage.fraction must be in the range 0 to 1; got ", min.coverage.fraction)
   }
   message("QC (CyTOF/CITE-seq): Filtering markers and empty cells (NAs treated as missing measurements).")
   data_counts <- .as_dense_matrix(data_counts)
@@ -2534,7 +2561,7 @@ classify <- function(sig_vals, th, th_i){
 #' Discretise a scaled query matrix against reference thresholds
 #'
 #' Computes per-cell p-values against the bootstrap-derived ECDFs and
-#' classifies each cell to {0, 0.5, 1, NA} at the configured `th` / `th_i`.
+#' classifies each cell to 0/0.5/1/NA at the configured `th` / `th_i`.
 #'
 #' @param query_ScaledData proteins x cells matrix.
 #' @param Ref_data Path to the reference directory.
@@ -2589,7 +2616,7 @@ Discretise_data <- function(query_ScaledData, Ref_data, thsback = NA, th = 0.05,
 #' }
 #'
 #' @param discrete.mat proteins x cells discretised matrix.
-#' @param min.coverage.fraction.sigframe Numeric in [0, 1].
+#' @param min.coverage.fraction.sigframe Numeric in the range 0 to 1.
 #' @param audit_csv_path Optional path; writes the excluded-from-baseline
 #'   gene table when set.
 #' @return list of length 5 (see Description).
@@ -2609,7 +2636,7 @@ Create.sig.frame <- function(discrete.mat,
   if (!is.numeric(min.coverage.fraction.sigframe) ||
       min.coverage.fraction.sigframe < 0 ||
       min.coverage.fraction.sigframe > 1) {
-    stop("Create.sig.frame: min.coverage.fraction.sigframe must be in [0, 1].")
+    stop("Create.sig.frame: min.coverage.fraction.sigframe must be in the range 0 to 1.")
   }
   # Build a per-gene summary of a discretised matrix and pre-compute the
   # population-wide binomial probabilities used by discrete.expr.levels().

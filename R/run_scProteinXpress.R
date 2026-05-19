@@ -67,9 +67,9 @@
 #' @param sqs_threshold Numeric. SQS cutoff when `apply_sqs != "none"`.
 #' @param apply_sqs "none" (default), "ref_only", "both".
 #' @param min.cells.feature integer. Minimum non-zero cells per marker.
-#' @param min.coverage.fraction Numeric in [0, 1]. Minimum coverage fraction
+#' @param min.coverage.fraction Numeric in the range 0 to 1. Minimum coverage fraction
 #'   per marker.
-#' @param min.coverage.fraction.sigframe Numeric in [0, 1]. Per-population
+#' @param min.coverage.fraction.sigframe Numeric in the range 0 to 1. Per-population
 #'   coverage filter for `Create.sig.frame()` baseline.
 #' @param qc_outlier_cells "auto" (default), "yes", "no".
 #' @param qc_nmads integer. Used by the scuttle filter when active.
@@ -183,10 +183,10 @@ run_scProteinXpress <- function(
   if (!is.numeric(ncores) || length(ncores) != 1L || ncores < 1L) stop("ncores must be a single integer >= 1")
   if (!is.numeric(target_ct) || length(target_ct) != 1L || target_ct < 1L) stop("target_ct must be a single integer >= 1")
   if (!is.numeric(min.coverage.fraction) || min.coverage.fraction < 0 || min.coverage.fraction > 1) {
-    stop("min.coverage.fraction must be in [0, 1]")
+    stop("min.coverage.fraction must be in the range 0 to 1")
   }
   if (!is.numeric(min.coverage.fraction.sigframe) || min.coverage.fraction.sigframe < 0 || min.coverage.fraction.sigframe > 1) {
-    stop("min.coverage.fraction.sigframe must be in [0, 1]")
+    stop("min.coverage.fraction.sigframe must be in the range 0 to 1")
   }
   if (!is.numeric(min.cells.feature) || min.cells.feature < 1L) stop("min.cells.feature must be >= 1")
   if (!nzchar(file.name)) stop("file.name must be a non-empty string")
