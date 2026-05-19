@@ -2,8 +2,8 @@ Package: scProtXpress
 Title: Single-cell Protein Expression Discretisation (CyTOF + CITE-seq)
 Version: 0.1.0
 Authors@R: c(
-    person(given = "Andoni",
-           family = "Perez",
+    person(given = "Aitor",
+           family = "Martínez Pérez",
            role = c("aut", "cre"),
            email = "amperez@cicbiogune.es"))
 Description: scProtXpress quantifies single-cell protein expression at the
@@ -16,19 +16,22 @@ Description: scProtXpress quantifies single-cell protein expression at the
     ingest while sharing every downstream step (QC, bootstrap, discretisation,
     signature frame, expression-level call).
 License: GPL-3
-URL: https://github.com/yourorg/scProtXpress
-BugReports: https://github.com/yourorg/scProtXpress/issues
+URL: https://github.com/aitoe96/scProtXpress
+BugReports: https://github.com/aitoe96/scProtXpress/issues
 Encoding: UTF-8
 LazyData: false
+biocViews:
 Depends:
     R (>= 4.1.0)
 Imports:
     ADTnorm,
     Matrix,
     flowCore,
+    flowStats,
     foreach,
     doParallel,
     parallel,
+    S4Vectors,
     stats,
     utils
 Suggests:
