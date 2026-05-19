@@ -400,7 +400,7 @@ run_scProteinXpress <- function(
       saveRDS(dataBack,     bg_counts_path)
       saveRDS(metadataBack, bg_meta_path)
       
-      # NORMALIZACIÓN DEL BACKGROUND
+      # BACKGROUND NORMALIZATION
       t_ref <- proc.time()
       norm.data <- suppressWarnings(ADTprot_norm(
         data_counts    = dataBack,
@@ -546,7 +546,7 @@ run_scProteinXpress <- function(
       query_all_norm <- readRDS(full_query_norm_path)
       metadataQuery2 <- readRDS(full_query_meta_path)
     } else {
-      # PREPARACIÓN DE LA QUERY
+      # QUERY PREPARATION
       t_q <- proc.time()
       query_all_norm <- suppressWarnings(PrepQueryData_ADT(
         query_dat             = dataQuery,

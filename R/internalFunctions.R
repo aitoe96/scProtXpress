@@ -29,7 +29,7 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
 
 # -----------------------------------------------------------------------------
 # SQS (Stain Quality Score) - static helpers
-# Devuelven 0 si faltan datos o la varianza es cero; nunca error fatal.
+# Return 0 if data is missing or variance is zero; never a fatal error.
 # -----------------------------------------------------------------------------
 .sqs_area_under_curve <- function(densityObj, threshold, peak_num){
   if (is.null(densityObj) || !is.finite(threshold)) return(0)
@@ -157,7 +157,7 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
   score
 }
 
-# Dispatcher: calcula SQS por muestra para un marcador, devuelve un named numeric.
+# Dispatcher: computes SQS per sample for a marker, returns a named numeric.
 .sqs_compute_per_sample <- function(marker_vec, sample_vec, valid_samples, peak_info, valley_info){
   out <- setNames(rep(0, length(valid_samples)), valid_samples)
   if (is.null(peak_info) || is.null(valley_info)) return(out)
@@ -185,7 +185,7 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
   out
 }
 
-# Append-only CSV logger (sin dependencias; thread-unsafe pero uso secuencial).
+# Append-only CSV logger (no dependencies; thread-unsafe but used sequentially).
 .sqs_log_append <- function(log_path, df_row){
   if (is.null(log_path) || !nzchar(log_path)) return(invisible(NULL))
   dir.create(dirname(log_path), recursive = TRUE, showWarnings = FALSE)
@@ -203,7 +203,7 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
 #
 # Intentionally NOT a replacement for the existing message()/cat() calls in
 # this file: those keep their wording and order verbatim per the rules of
-# Hito 2 ("No cambias la lógica numérica" and the unwritten "no churn"
+# Milestone 2 ("Do not change the numerical logic" and the unwritten "no churn"
 # corollary on log lines). `.log_step()` is opt-in scaffolding for new
 # instrumentation only.
 .log_step <- function(label, ..., level = c("info", "warn"), .stream = stderr()) {
@@ -732,10 +732,10 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     apply_sqs = "none",
     do_subsample = TRUE,
     target_ct = 2000L,
-    # NOTA: estos defaults reflejan los nombres internos que run_scProteinXpress
-    # ya impone vía la "TRADUCCIÓN INTERNA DE METADATOS" (cell.type / tissue /
-    # dataset). Si se llama a .ADTprot_norm_ref con metadata que aún use los
-    # nombres externos (cell_type / dataset_id), hay que pasarlos explícitamente.
+    # NOTE: these defaults reflect the internal names that run_scProteinXpress
+    # already enforces via the "internal metadata translation" (cell.type / tissue /
+    # dataset). If .ADTprot_norm_ref is called with metadata that still uses the
+    # external names (cell_type / dataset_id), they must be passed explicitly.
     ct_col = "cell.type",
     tissue_col = "tissue",
     dataset_col = "dataset",
@@ -797,17 +797,17 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   
   sqs_log_path <- file.path(outdir, paste0(file.id, "_SQS_ref_log.csv"))
   
-  # Cap ncores al número de marcadores: no tiene sentido pedir más workers que tareas.
+  # Cap ncores to the number of markers: no sense in requesting more workers than tasks.
   effective_ncores <- if (is.numeric(ncores) && length(ncores) == 1L)
     min(as.integer(ncores), length(adt_marker_index_list)) else 1L
   
   cl <- NULL
   use_parallel <- effective_ncores >= 2L && length(adt_marker_index_list) >= 2L
   
-  # --- Fijar BLAS a 1 hilo en el proceso master y en cada worker (CLAVE) -----
-  # Sin esto, OpenBLAS/MKL lanzan multi-hilo implícito en density/ splines /etc.
-  # Con N workers * M hilos BLAS la sobresuscripción mata el speedup.
-  # Guardamos el valor previo para restaurarlo al salir.
+  # --- Pin BLAS to 1 thread in the master process and in each worker (KEY) -----
+  # Without this, OpenBLAS/MKL launch implicit multi-threading in density/splines/etc.
+  # With N workers * M BLAS threads the oversubscription kills the speedup.
+  # We save the previous value to restore it on exit.
   .prev_blas_threads <- NA_integer_
   .prev_omp_threads  <- Sys.getenv("OMP_NUM_THREADS", unset = NA)
   .prev_mkl_threads  <- Sys.getenv("MKL_NUM_THREADS", unset = NA)
@@ -819,7 +819,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
       try(RhpcBLASctl::blas_set_num_threads(1L),  silent = TRUE)
       try(RhpcBLASctl::omp_set_num_threads(1L),   silent = TRUE)
     }
-    # Fallback vía env-vars (afecta a workers fork; PSOCK los hereda).
+    # Fallback via env-vars (affects fork workers; PSOCK inherits them).
     Sys.setenv(OMP_NUM_THREADS      = "1")
     Sys.setenv(MKL_NUM_THREADS      = "1")
     Sys.setenv(OPENBLAS_NUM_THREADS = "1")
@@ -834,13 +834,13 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
         parallel::makePSOCKcluster(effective_ncores)
       }
     }, error = function(e) {
-      message("[parallel] No se pudo crear cluster (", conditionMessage(e),
-              "); ejecutando en secuencial.")
+      message("[parallel] Could not create cluster (", conditionMessage(e),
+              "); running sequentially.")
       NULL
     })
     if (!is.null(cl)) {
       doParallel::registerDoParallel(cl)
-      # Asegurar en workers PSOCK también (fork hereda env-vars del padre).
+      # Ensure in PSOCK workers as well (fork inherits env-vars from the parent).
       if (.Platform$OS.type != "unix") {
         try(parallel::clusterEvalQ(cl, {
           Sys.setenv(OMP_NUM_THREADS = "1",
@@ -855,14 +855,14 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     }
   }
   
-  # Log explícito: no dejar duda de si la paralelización está activa.
+  # Explicit log: leave no doubt about whether parallelization is active.
   if (use_parallel && !is.null(cl)) {
-    message(sprintf("[PARALLEL][ref] Cluster creado: %d workers (%s) para %d marcadores.",
+    message(sprintf("[PARALLEL][ref] Cluster created: %d workers (%s) for %d markers.",
                     effective_ncores,
                     if (.Platform$OS.type == "unix") "fork" else "PSOCK",
                     length(adt_marker_index_list)))
   } else {
-    message(sprintf("[PARALLEL][ref] Ejecución SECUENCIAL (ncores=%s, use_parallel=%s).",
+    message(sprintf("[PARALLEL][ref] SEQUENTIAL execution (ncores=%s, use_parallel=%s).",
                     as.character(ncores), as.character(use_parallel)))
   }
   
@@ -893,24 +893,24 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   `%OP%` <- if (use_parallel && !is.null(cl)) `%dopar%` else `%do%`
   
   # -------------------------------------------------------------------------
-  # PAYLOAD REDUCIDO POR WORKER (CLAVE para matrices grandes)
+  # REDUCED PAYLOAD PER WORKER (KEY for large matrices)
   # ---------------------------------------------------------------------
-  # En el diseño anterior cada worker recibía cell_x_adt y cell_x_feature
-  # completos. Con fork esto usa COW pero, en R, `cell_x_adt[, j] <- NA`
-  # dentro del worker dispara copy-on-modify a nivel de objeto → cada
-  # worker duplicaba la matriz entera en RAM (oversubscription → thrashing).
-  # Aquí pre-extraemos SÓLO la columna del marcador + un slim del
-  # feature-frame (sample, batch). El helper sigue siendo funcional porque
-  # sus llamadas internas (get_peak_mode, get_valley_location, etc.)
-  # operan sobre cell_x_adt_sub[, adt_marker_select], que es exactamente
-  # esa columna.
+  # In the previous design each worker received the full cell_x_adt and
+  # cell_x_feature. With fork this uses COW but, in R, `cell_x_adt[, j] <- NA`
+  # inside the worker triggers copy-on-modify at object level -> each
+  # worker duplicated the entire matrix in RAM (oversubscription -> thrashing).
+  # Here we pre-extract ONLY the marker column + a slim version of the
+  # feature-frame (sample, batch). The helper remains functional because
+  # its internal calls (get_peak_mode, get_valley_location, etc.)
+  # operate on cell_x_adt_sub[, adt_marker_select], which is exactly
+  # that column.
   # -------------------------------------------------------------------------
   sample_vec_full <- cell_x_feature$sample
   feature_slim    <- cell_x_feature[, intersect(c("sample", "batch"),
                                                 colnames(cell_x_feature)),
                                     drop = FALSE]
-  # Construir por adelantado la lista de datos por-marcador (UNA SOLA VEZ):
-  # con fork esto se comparte por COW; con PSOCK se serializa sólo lo mínimo.
+  # Build the per-marker data list up front (ONLY ONCE):
+  # with fork this is shared via COW; with PSOCK only the minimum is serialized.
   marker_payload <- lapply(adt_marker_index_list, function(k) {
     tmp_name <- colnames(cell_x_adt)[k]
     list(
@@ -927,13 +927,13 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     .export          = .exports_needed,
     .errorhandling   = "pass"
   ) %OP% {
-    # Reconstruir una matriz de UNA columna con el mismo rowname que esperan
-    # get_peak_mode / get_valley_location / peak_alignment.
+    # Reconstruct a ONE-column matrix with the same rowname that
+    # get_peak_mode / get_valley_location / peak_alignment expect.
     local_mat <- matrix(payload$marker_col, ncol = 1L,
                         dimnames = list(names(payload$marker_col), payload$tmp_name))
     
     .run_one_marker_ref(
-      adt_marker_index         = 1L,                     # siempre 1 en la submatriz
+      adt_marker_index         = 1L,                     # always 1 in the submatrix
       cell_x_adt               = local_mat,
       cell_x_feature           = feature_slim,
       original_marker_name     = original_marker_name[payload$adt_marker_index],
@@ -964,7 +964,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   message(sprintf("[TIMING][ref] foreach elapsed: %.2fs",
                   (proc.time() - t_foreach)[["elapsed"]]))
   
-  # Reasignar tmp_name real (el helper lo devolvió como el de la submatriz).
+  # Reassign the real tmp_name (the helper returned it as the submatrix's name).
   for (i in seq_along(marker_results)) {
     if (!inherits(marker_results[[i]], "error") &&
         !is.null(marker_results[[i]]) &&
@@ -982,8 +982,8 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   
   for (res in marker_results) {
     if (inherits(res, "error") || is.null(res) || is.null(res$tmp_name)) {
-      msg <- if (inherits(res, "error")) conditionMessage(res) else "resultado inválido"
-      message("[parallel] Un worker falló: ", msg, " (se salta el marker).")
+      msg <- if (inherits(res, "error")) conditionMessage(res) else "invalid result"
+      message("[parallel] A worker failed: ", msg, " (skipping the marker).")
       next
     }
     if (!is.null(res$norm_col_override)) {
@@ -999,7 +999,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   norm_fxC <- t(as.matrix(cell_x_adt_norm))
   
   if (do_subsample) {
-    if (verbose) message("Aplicando subsampling jerárquico...")
+    if (verbose) message("Applying hierarchical subsampling...")
     set.seed(seed)
     
     if (!"cell_id" %in% colnames(metadata)) {
@@ -1009,8 +1009,8 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     all_na_cells <- rowSums(!is.na(cell_x_adt_norm)) == 0
     if (any(all_na_cells)) {
       drop_ids <- rownames(cell_x_adt_norm)[all_na_cells]
-      if (verbose) message("SQS: excluyendo ", length(drop_ids),
-                           " células con el 100% de marcadores en NA del pool de subsampling.")
+      if (verbose) message("SQS: excluding ", length(drop_ids),
+                           " cells with 100% of markers in NA from the subsampling pool.")
       metadata <- metadata[!(metadata$cell_id %in% drop_ids), , drop = FALSE]
     }
     
@@ -1050,10 +1050,10 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     valid_ids <- intersect(selected_ids, colnames(norm_fxC))
     
     if (length(valid_ids) == 0) {
-      warning("El subsampling devolvió 0 células o los IDs no cruzan con norm_fxC. Se devuelve matriz original.")
+      warning("Subsampling returned 0 cells or the IDs do not intersect with norm_fxC. The original matrix is returned.")
     } else {
       norm_fxC <- norm_fxC[, valid_ids, drop = FALSE]
-      if (verbose) message("Subsampling finalizado. Células retenidas: ", ncol(norm_fxC))
+      if (verbose) message("Subsampling finished. Cells retained: ", ncol(norm_fxC))
     }
   }
   
@@ -1081,7 +1081,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   out_skip <- list(
     marker_name       = marker_name,
     tmp_name          = adt_marker_select,
-    norm_col_override = NULL,  # Se mantiene la filosofía: NULL = ignorar en master
+    norm_col_override = NULL,  # Keep the philosophy: NULL = ignore in master
     sqs_rows          = list()
   )
   
@@ -1101,7 +1101,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     }
   }
   
-  # Si no hay muestras válidas, se devuelve el vector recortado y se salta (como el secuencial)
+  # If there are no valid samples, return the clipped vector and skip (as in the sequential branch)
   if (length(valid_samples) == 0) {
     return(list(marker_name = marker_name, tmp_name = adt_marker_select,
                 norm_col_override = marker_vec, sqs_rows = list()))
@@ -1306,7 +1306,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   cl <- NULL
   use_parallel <- effective_ncores >= 2L && length(markers_to_run) >= 2L
   
-  # --- Fijar BLAS a 1 hilo por worker: evita oversubscription ---------------
+  # --- Pin BLAS to 1 thread per worker: avoids oversubscription ---------------
   .prev_blas_threads <- NA_integer_
   .prev_omp_threads  <- Sys.getenv("OMP_NUM_THREADS", unset = NA)
   .prev_mkl_threads  <- Sys.getenv("MKL_NUM_THREADS", unset = NA)
@@ -1332,7 +1332,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
         parallel::makePSOCKcluster(effective_ncores)
       }
     }, error = function(e) {
-      message("[parallel] No se pudo crear cluster (", conditionMessage(e), "); ejecutando en secuencial.")
+      message("[parallel] Could not create cluster (", conditionMessage(e), "); running sequentially.")
       NULL
     })
     if (!is.null(cl)) {
@@ -1352,12 +1352,12 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   }
   
   if (use_parallel && !is.null(cl)) {
-    message(sprintf("[PARALLEL][query] Cluster creado: %d workers (%s) para %d marcadores.",
+    message(sprintf("[PARALLEL][query] Cluster created: %d workers (%s) for %d markers.",
                     effective_ncores,
                     if (.Platform$OS.type == "unix") "fork" else "PSOCK",
                     length(markers_to_run)))
   } else {
-    message(sprintf("[PARALLEL][query] Ejecución SECUENCIAL (ncores=%s, use_parallel=%s).",
+    message(sprintf("[PARALLEL][query] SEQUENTIAL execution (ncores=%s, use_parallel=%s).",
                     as.character(ncores), as.character(use_parallel)))
   }
   
@@ -1424,8 +1424,8 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   
   for (res in marker_results_q) {
     if (inherits(res, "error") || is.null(res) || is.null(res$tmp_name)) {
-      msg <- if (inherits(res, "error")) conditionMessage(res) else "resultado inválido"
-      message("[parallel] Un worker falló: ", msg, " (se salta el marker en query).")
+      msg <- if (inherits(res, "error")) conditionMessage(res) else "invalid result"
+      message("[parallel] A worker failed: ", msg, " (skipping the marker in query).")
       next
     }
     if (!is.null(res$norm_col_override)) {
@@ -1495,12 +1495,12 @@ ADTprot_norm <- function(data_counts,
                          is_transformed = NULL,
                          sqs_threshold = 1.0,
                          apply_sqs = "none",
-                         # --- Subsampling jerárquico (solo aplica a la rama Ref) ---
-                         # do_subsample debe permanecer TRUE para garantizar que
-                         # el background siempre se construye con un nº balanceado
-                         # de células por (cell_type x tissue x dataset). target_ct
-                         # es el cap por cell_type y es el único parámetro que se
-                         # expone para configurar el tamaño del filtro.
+                         # --- Hierarchical subsampling (only applies to the Ref branch) ---
+                         # do_subsample must remain TRUE to guarantee that
+                         # the background is always built with a balanced number
+                         # of cells per (cell_type x tissue x dataset). target_ct
+                         # is the cap per cell_type and is the only parameter
+                         # exposed to configure the filter size.
                          do_subsample = TRUE,
                          target_ct = 2000L,
                          ncores = 1L){
@@ -1980,20 +1980,20 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
   cell_ids_all <- as.character(metadata$cell.id)
   
   if (nlevels == 1) {
-    # split(cellid, as.factor(cellid)) en el original => agrupa por la
-    # combinación (que aquí solo es cell.type). Lo replicamos.
+    # split(cellid, as.factor(cellid)) in the original => groups by the
+    # combination (which here is only cell.type). We replicate it.
     by_ct <- split(cell_ids_all, as.factor(cellid_vec))
-    # Estructura uniforme: ct -> "_NONE_" -> cell.ids (para reusar el código
-    # de la rama nlevels>=2). El consumidor sabrá que es nlevels==1 vía un flag.
+    # Uniform structure: ct -> "_NONE_" -> cell.ids (to reuse the code
+    # from the nlevels>=2 branch). The consumer will know it is nlevels==1 via a flag.
     groups_skeleton <- lapply(by_ct, function(ids) list("_NONE_" = ids))
   } else {
-    # En el original se hace strsplit(cellid, "[.]")[[1]][1] y [2] para recuperar
-    # cell.type y tissue. Como ya tenemos las columnas en metadata, las usamos
-    # directamente (más rápido y libre del bug latente "punto en el nombre").
+    # In the original, strsplit(cellid, "[.]")[[1]][1] and [2] are used to recover
+    # cell.type and tissue. Since we already have the columns in metadata, we use them
+    # directly (faster and free of the latent "dot-in-the-name" bug).
     ct_vec <- as.character(metadata[[clusterids_vec[1]]])
     ts_vec <- as.character(metadata[[clusterids_vec[2]]])
     
-    # Orden alfabético de cell.types (== levels(as.factor(...)) == orden split())
+    # Alphabetical order of cell.types (== levels(as.factor(...)) == split() order)
     ct_levels <- levels(as.factor(ct_vec))
     groups_skeleton <- lapply(ct_levels, function(ct) {
       idx_ct <- which(ct_vec == ct)
@@ -2017,23 +2017,23 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
     keep <- !is.na(vals) & vals > 0
     vals <- vals[keep]
     if (length(vals) < min.cells.gexp) {
-      # Equivalente a return(NULL) en el lapply original.
+      # Equivalent to return(NULL) in the original lapply.
       vals_by_marker[[m]] <- NULL
       groups_by_marker[[m]] <- NULL
       next
     }
     vals_by_marker[[m]] <- vals  # named vector
     
-    # Replicar EXACTAMENTE el intersect(names(cells_dat), names(a)) original:
-    # el primer argumento manda el orden -> usar names(vals).
+    # Replicate EXACTLY the original intersect(names(cells_dat), names(a)):
+    # the first argument dictates the order -> use names(vals).
     valid_ids <- names(vals)
     valid_set <- structure(seq_along(valid_ids), names = valid_ids)  # lookup O(1)
     
     groups_by_marker[[m]] <- lapply(groups_skeleton, function(ct_list) {
       lapply(ct_list, function(ids_in_group) {
-        # Equivalente a intersect(names(vals), ids_in_group) preservando
-        # orden de names(vals). match() devuelve NA en los no presentes;
-        # ordenamos por la posición en valid_ids para replicar el orden.
+        # Equivalent to intersect(names(vals), ids_in_group) preserving
+        # the order of names(vals). match() returns NA for the missing ones;
+        # we sort by position in valid_ids to replicate the order.
         pos <- valid_set[ids_in_group]
         pos <- pos[!is.na(pos)]
         if (length(pos) == 0) return(character(0))
@@ -2054,18 +2054,18 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
 
 # -----------------------------------------------------------------------------
 # .sample_data_fast
-# Replica la lógica de sample.data() pero opera sobre las estructuras
-# pre-computadas en .precompute_bootstrap_inputs(). full_lengths_for_marker
-# guarda los tamaños de cada grupo ANTES del intersect con valid_ids, igual
-# que length(x) / length(set.tissue) en el original.
+# Replicates the logic of sample.data() but operates on the structures
+# pre-computed in .precompute_bootstrap_inputs(). full_lengths_for_marker
+# stores the sizes of each group BEFORE the intersect with valid_ids, just
+# like length(x) / length(set.tissue) in the original.
 # -----------------------------------------------------------------------------
 .sample_data_fast <- function(vals, groups_for_marker, full_lengths_for_marker,
                               ncells.sample, nlevels) {
   if (nlevels == 1) {
     # set <- split(cellid, as.factor(cellid))
-    # En nuestra estructura nlevels==1, groups_for_marker[[ct]][["_NONE_"]] son
-    # los cell.ids válidos; full_lengths_for_marker[[ct]][["_NONE_"]] es
-    # length(x) (la partición completa antes del intersect).
+    # In our nlevels==1 structure, groups_for_marker[[ct]][["_NONE_"]] are
+    # the valid cell.ids; full_lengths_for_marker[[ct]][["_NONE_"]] is
+    # length(x) (the full partition before the intersect).
     set_cells <- unlist(lapply(names(groups_for_marker), function(ct) {
       pick   <- groups_for_marker[[ct]][["_NONE_"]]
       x_len  <- full_lengths_for_marker[[ct]][["_NONE_"]]
@@ -2076,27 +2076,27 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
       }
     }))
   } else {
-    # nlevels >= 2: replica la lógica del original paso a paso.
+    # nlevels >= 2: replicates the logic of the original step by step.
     set_cells <- unlist(lapply(names(groups_for_marker), function(ct) {
       ts_list   <- groups_for_marker[[ct]]              # ts -> picktis
-      ts_full_l <- full_lengths_for_marker[[ct]]        # ts -> length completa
-      ts_names  <- names(ts_list)                       # ya en orden alfabético
-      
-      # n calculado con length(set.tissue) ANTES del filtro.
+      ts_full_l <- full_lengths_for_marker[[ct]]        # ts -> full length
+      ts_names  <- names(ts_list)                       # already in alphabetical order
+
+      # n computed with length(set.tissue) BEFORE the filter.
       n_total_tissues <- length(ts_names)
       if (n_total_tissues == 0) return(NA_character_)
       n <- round(ncells.sample / n_total_tissues)
-      
-      # Filtrar tissues con length(a) >= n (length DEL GRUPO COMPLETO, no de picktis)
+
+      # Filter tissues with length(a) >= n (length OF THE FULL GROUP, not of picktis)
       keep_ts <- ts_names[vapply(ts_names,
                                  function(ts) ts_full_l[[ts]] >= n,
                                  logical(1))]
       if (length(keep_ts) == 0) return(NA_character_)
-      
-      # sn recalculado con set.tissue post-filtro (puede diferir de n).
+
+      # sn recomputed with set.tissue post-filter (may differ from n).
       sn <- round(ncells.sample / length(keep_ts))
-      
-      # Loop por tissues en el MISMO ORDEN que el split() original (alfabético).
+
+      # Loop over tissues in the SAME ORDER as the original split() (alphabetical).
       set_cells_tis <- unlist(lapply(keep_ts, function(ts) {
         picktis <- ts_list[[ts]]
         a_full_len <- ts_full_l[[ts]]
@@ -2109,7 +2109,7 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
       
       set_cells_tis <- set_cells_tis[!is.na(set_cells_tis)]
       if (length(set_cells_tis) >= 50) {
-        # Sample() final de ajuste a ncells.sample (idéntico al original).
+        # Final Sample() adjustment to ncells.sample (identical to the original).
         if (length(set_cells_tis) != ncells.sample) {
           set_cells_tis <- sample(x = set_cells_tis, size = ncells.sample, replace = TRUE)
         }
@@ -2155,7 +2155,7 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
     )
   }
   
-  # Mismo postproceso que el original:
+  # Same post-processing as the original:
   ids_samples_byGene <- ids_samples_byGene[!sapply(ids_samples_byGene, is.null)]
   ids_samples_byGene
 }
@@ -2202,7 +2202,7 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
   GetThresholds(processed.back = sampled.back, file.id = file.id)
 }
 # -----------------------------------------------------------------------------
-# RunBootstrap (versión optimizada)
+# RunBootstrap (optimized version)
 # -----------------------------------------------------------------------------
 #' Bootstrap per-marker threshold distributions
 #'
@@ -2238,7 +2238,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
   set.seed(fixseed)
   cl <- NULL
   
-  # --- Resolución robusta de ncores cross-platform / cross-scheduler ---------
+  # --- Robust ncores resolution cross-platform / cross-scheduler ---------
   resolve_ncores <- function(ncores_req, n_tasks) {
     slurm_cpus <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK",
                                                          unset = NA)))
@@ -2259,7 +2259,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
   effective_ncores <- resolve_ncores(ncores, num.boot.sample)
   use_parallel <- isTRUE(parallelize) && effective_ncores >= 2L && num.boot.sample >= 2L
   
-  # --- Fijar BLAS/OMP/MKL a 1 hilo (padre y workers) -------------------------
+  # --- Pin BLAS/OMP/MKL to 1 thread (parent and workers) -------------------------
   .prev_blas_threads <- NA_integer_
   .prev_omp_threads  <- Sys.getenv("OMP_NUM_THREADS",      unset = NA)
   .prev_mkl_threads  <- Sys.getenv("MKL_NUM_THREADS",      unset = NA)
@@ -2277,10 +2277,10 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
     Sys.setenv(OPENBLAS_NUM_THREADS = "1")
   }
   
-  # --- PRECOMPUTACIÓN: solo en ramas estratificadas (T-7.3) -------------------
-  # bootstrap_stratify == "none" pesa sobre `data_norm` directamente (pool
-  # global por marker), así que no hay nada que precomputar y `data_norm`
-  # debe seguir vivo cuando entremos al foreach.
+  # --- PRECOMPUTATION: only in stratified branches (T-7.3) -------------------
+  # bootstrap_stratify == "none" operates on `data_norm` directly (global
+  # pool per marker), so there is nothing to precompute and `data_norm`
+  # must remain alive when we enter the foreach.
   precomp <- NULL
   if (bootstrap_stratify != "none") {
   t_pre <- proc.time()
@@ -2294,14 +2294,14 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
   build_full_lengths <- function(metadata, clusterids_vec, markers, nlevels) {
     if (nlevels == 1) {
       cellid_vec <- do.call(paste, c(metadata[, clusterids_vec, drop = FALSE], sep = "."))
-      # length(x) en sample.data nlevels==1: el split por cellid agrupa todas
-      # las células con ese cellid; length(x) es ese conteo.
+      # length(x) in sample.data nlevels==1: the split by cellid groups all
+      # cells with that cellid; length(x) is that count.
       tab <- table(cellid_vec)
       ct_levels <- names(tab)
       lens_one <- lapply(ct_levels, function(ct) list("_NONE_" = as.integer(tab[[ct]])))
       names(lens_one) <- ct_levels
-      # Es independiente del marcador, así que replicamos la misma lista por
-      # cada marcador para mantener la interfaz uniforme.
+      # It is independent of the marker, so we replicate the same list for
+      # each marker to keep the interface uniform.
       out <- vector("list", length(markers))
       names(out) <- markers
       for (m in markers) out[[m]] <- lens_one
@@ -2320,8 +2320,8 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
       out
     })
     names(lens_skeleton) <- ct_levels
-    # length(set.tissue) en el original es independiente del marcador
-    # (es la partición de la metadata completa por ct, ts).
+    # length(set.tissue) in the original is independent of the marker
+    # (it is the partition of the full metadata by ct, ts).
     out <- vector("list", length(markers))
     names(out) <- markers
     for (m in markers) out[[m]] <- lens_skeleton
@@ -2338,7 +2338,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
   rm(data_norm); invisible(gc(verbose = FALSE))
   }  # end if (bootstrap_stratify != "none")
   
-  # --- Crear cluster: fork en Unix, PSOCK en Windows -------------------------
+  # --- Create cluster: fork on Unix, PSOCK on Windows -------------------------
   if (use_parallel) {
     try(unregister_dopar(), silent = TRUE)
     cl <- tryCatch({
@@ -2348,8 +2348,8 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
         parallel::makePSOCKcluster(effective_ncores)
       }
     }, error = function(e) {
-      message("[parallel][RunBootstrap] No se pudo crear cluster (",
-              conditionMessage(e), "); cayendo a secuencial.")
+      message("[parallel][RunBootstrap] Could not create cluster (",
+              conditionMessage(e), "); falling back to sequential.")
       NULL
     })
     
@@ -2371,14 +2371,14 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
   
   n_markers_msg <- if (is.null(precomp)) nrow(data_norm) else length(precomp$markers)
   if (use_parallel && !is.null(cl)) {
-    message(sprintf("[PARALLEL][bootstrap] Cluster creado: %d workers (%s) para %d iteraciones (%d marcadores por iteración, stratify=%s).",
+    message(sprintf("[PARALLEL][bootstrap] Cluster created: %d workers (%s) for %d iterations (%d markers per iteration, stratify=%s).",
                     effective_ncores,
                     if (.Platform$OS.type == "unix") "fork" else "PSOCK",
                     num.boot.sample,
                     n_markers_msg,
                     bootstrap_stratify))
   } else {
-    message(sprintf("[PARALLEL][bootstrap] Ejecución SECUENCIAL (ncores_solicitado=%s, effective=%d, parallelize=%s, stratify=%s).",
+    message(sprintf("[PARALLEL][bootstrap] SEQUENTIAL execution (ncores_requested=%s, effective=%d, parallelize=%s, stratify=%s).",
                     as.character(ncores), effective_ncores,
                     as.character(parallelize), bootstrap_stratify))
   }
@@ -2397,7 +2397,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
     if (is.na(.prev_openblas_t))  Sys.unsetenv("OPENBLAS_NUM_THREADS") else Sys.setenv(OPENBLAS_NUM_THREADS = .prev_openblas_t)
   }, add = TRUE)
   
-  # --- Bucle principal -------------------------------------------------------
+  # --- Main loop -------------------------------------------------------
   `%OP%` <- if (use_parallel && !is.null(cl)) foreach::`%dopar%` else foreach::`%do%`
   
   t_boot <- proc.time()
@@ -2420,7 +2420,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
   message(sprintf("[TIMING][bootstrap] foreach elapsed: %.2fs",
                   (proc.time() - t_boot)[["elapsed"]]))
   
-  # --- Post-proceso idéntico al original -------------------------------------
+  # --- Post-processing identical to the original -------------------------------------
   ng <- length(th_list[[1]])
   thrs_list <- lapply(seq_len(ng), function(i){
     gthrs <- do.call("rbind", lapply(th_list, function(a) a[[i]]))
@@ -2459,10 +2459,10 @@ GetBackground <- function(data_norm, dir_name, file.id, metadata, sample_n, para
   bootstrap_stratify <- match.arg(bootstrap_stratify)
   data_norm <- .as_dense_matrix(data_norm)
 
-  ## T-7.4: resolución explícita de `clusterids_vec` a partir de
-  ## `bootstrap_stratify`. Reemplaza la heurística previa
-  ## (presencia/ausencia de `tissue`) por una decisión guiada por el
-  ## usuario.
+  ## T-7.4: explicit resolution of `clusterids_vec` from
+  ## `bootstrap_stratify`. Replaces the previous heuristic
+  ## (presence/absence of `tissue`) with a user-driven
+  ## decision.
   if (identical(bootstrap_stratify, "cell.type_tissue") &&
       !all(c("cell.type", "tissue") %in% colnames(metadata))) {
     warning("GetBackground: requested cell.type_tissue stratification but ",
