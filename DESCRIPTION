@@ -11,7 +11,7 @@ Description: scProtXpress quantifies single-cell protein expression at the
     negative / valley / positive peaks), discretising query cells against the
     bootstrap thresholds of a reference, and calling expression levels per
     population with a binomial test on the discretised matrix. The same
-    pipeline handles CyTOF and CITE-seq inputs through a single
+    pipeline handles CyTOF and CITE-seq scProtein inputs through a single
     `run_scProteinXpress()` entry point that dispatches modality-specific
     ingest while sharing every downstream step (QC, bootstrap, discretisation,
     signature frame, expression-level call).
