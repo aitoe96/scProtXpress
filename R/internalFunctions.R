@@ -9,9 +9,9 @@
 #   * RunBootstrap       : one-shot precompute + .RunBackComputations_fast
 #                          inside foreach %dopar% (cell.type x tissue strata).
 #   * resolve_ncores honours SLURM_CPUS_PER_TASK.
-#   * Mode C P2 global QC with audit CSV (cleanData_ADT).
-#   * Mode C P3 binomial sig_frame (Create.sig.frame + discrete.expr.levels).
-#   * Self-query persistence (P1) handled by run_scProteinXpress().
+#   * Global QC with audit CSV (cleanData_ADT).
+#   * Binomial sig_frame (Create.sig.frame + discrete.expr.levels).
+#   * Self-query persistence handled by run_scProteinXpress().
 ###############################################################################
 
 #' @import foreach
@@ -196,16 +196,14 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
   invisible(NULL)
 }
 
-# Internal timestamped logger (T-6, unification).
+# Internal timestamped logger.
 # Returns invisibly so it can be embedded in pipelines without affecting the
 # return values of the wrapping block. The format is ISO-8601 down to the
 # second to allow log greps and downstream parsing.
 #
-# Intentionally NOT a replacement for the existing message()/cat() calls in
-# this file: those keep their wording and order verbatim per the rules of
-# Milestone 2 ("Do not change the numerical logic" and the unwritten "no churn"
-# corollary on log lines). `.log_step()` is opt-in scaffolding for new
-# instrumentation only.
+# Intentionally NOT a replacement for the existing message()/cat() calls
+# elsewhere in this file, which keep their wording and order unchanged.
+# `.log_step()` is opt-in scaffolding for new instrumentation only.
 .log_step <- function(label, ..., level = c("info", "warn"), .stream = stderr()) {
   level <- match.arg(level)
   ts <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S")
@@ -220,7 +218,7 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
 }
 
 # -----------------------------------------------------------------------------
-# Modality dispatch helpers (T-1, unification).
+# Modality dispatch helpers.
 #
 # `.ingest_<modality>()` is invoked from run_scProteinXpress() at the very
 # top of the pipeline. Its sole responsibility is to coerce `data` into the
@@ -261,7 +259,7 @@ if (!requireNamespace("tictoc", quietly = TRUE)) {
   list(data = data, metadata = as.data.frame(metadata, stringsAsFactors = FALSE))
 }
 
-# `.resolve_meta_col()` standardises metadata column resolution (A1):
+# `.resolve_meta_col()` standardises metadata column resolution:
 # - Tries `primary` first; then each entry in `fallbacks` in order.
 # - First column found is renamed in place to `internal_name`.
 # - If none match: either fall back to a constant (`fallback_value`),
@@ -345,7 +343,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   list(cell_x_adt = cell_x_adt, cell_x_feature = cell_x_feature)
 }
 
-## .detect_input_mode() -- three-valued is_transformed semantics (T-2).
+## .detect_input_mode() -- three-valued is_transformed semantics.
 ##
 ##   is_transformed = NULL   (default)
 ##     "decide for me": run the integer-coercibility heuristic. Treat the
@@ -370,6 +368,41 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 ## "exprs" assay; it is unaffected. Drivers that previously omitted the
 ## argument (CITE-seq `codebase/run_scProteinXpress.R`) now get NULL via
 ## the unified API, which preserves the prior autodetect behaviour.
+#' Distributional sanity check for the "already transformed" branch
+#'
+#' `.detect_input_mode()`'s autodetection is purely syntactic (is the matrix
+#' integer-coercible?), and an explicit `is_transformed = TRUE` is taken on
+#' faith. Neither checks that "already transformed" actually means
+#' "arcsinh-transformed", which is what the reference thresholds assume.
+#' Public CITE-seq deposits frequently ship DSB- or CLR-normalised ADT
+#' values instead (roughly Gaussian, substantial negative mass) -- those
+#' pass this gate silently and get scored against arcsinh-based reference
+#' thresholds on a mismatched scale with no warning anywhere else in the
+#' pipeline. arcsinh(raw_count/5 + 1)-style transforms of non-negative raw
+#' input are essentially always >= 0, so a simple, cheap proxy is the
+#' fraction of negative values.
+#' @noRd
+.sanity_check_transformed_scale <- function(matrix_in, source = c("autodetect", "forced")){
+  source <- match.arg(source)
+  vals <- matrix_in[!is.na(matrix_in)]
+  if (length(vals) == 0) return(invisible(NA_real_))
+  frac_negative <- mean(vals < 0)
+  if (frac_negative > 0.05) {
+    warning(sprintf(
+      paste0(
+        ".detect_input_mode: input was %s as already-transformed, but %.1f%% ",
+        "of finite values are negative. arcsinh-transformed raw counts (what this ",
+        "package's reference thresholds assume) are essentially always >= 0 for ",
+        "non-negative raw input -- this looks more consistent with a DSB- or ",
+        "CLR-normalised (or z-scored) input than an arcsinh transform. If so, ",
+        "query-time comparisons against the arcsinh-based reference thresholds will ",
+        "silently run on a mismatched scale. Re-derive from raw counts + arcsinh, or ",
+        "build/query with data normalised the same way throughout."
+      ), source, 100 * frac_negative), call. = FALSE)
+  }
+  invisible(frac_negative)
+}
+
 .detect_input_mode <- function(cell_x_adt, neg_candidate_thres = NULL,
                                is_transformed = NULL, verbose = TRUE) {
   matrix_in <- as.matrix(cell_x_adt)
@@ -381,10 +414,13 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
       as_int[!is.na(as_int)] != matrix_in[!is.na(matrix_in)],
       na.rm = TRUE
     )
+    detect_source <- "autodetect"
   } else if (isTRUE(is_transformed)) {
     is_already_transformed <- TRUE
+    detect_source <- "forced"
   } else if (isFALSE(is_transformed)) {
     is_already_transformed <- FALSE
+    detect_source <- "forced"
   } else {
     stop(".detect_input_mode: is_transformed must be NULL, TRUE, or FALSE.")
   }
@@ -394,6 +430,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     if (is.null(neg_candidate_thres)) {
       neg_candidate_thres <- asinh(1/5 + 1)
     }
+    .sanity_check_transformed_scale(matrix_in, source = detect_source)
   } else {
     if (any(matrix_in[!is.na(matrix_in)] < 0)) {
       warning("ADTnorm detects integer input ADT count matrix and assumes the input is raw count. Please check why there is any negative values in the raw count matrix.")
@@ -1243,13 +1280,13 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 .ADTprot_norm_query <- function(data_counts, metadata, bg.prot.pars, file.id, outdir,
                                 sample_col, batch_col, marker_to_process, verbose,
                                 saveData, is_transformed,
-                                ## T-4: defaults aligned across the chain so SQS is
+                                ## Defaults aligned across the chain so SQS is
                                 ## off-by-default. Callers downstream of run_scProteinXpress
                                 ## still inherit gs$apply_sqs from bg.prot.pars when
-                                ## available (see ADTprot_norm wrapper, line ~1518).
+                                ## available (see ADTprot_norm wrapper).
                                 sqs_threshold = 1.0, apply_sqs = "none",
                                 ncores = 1L){
-  ## T-5: validate bg.prot.pars before touching anything else. An empty or
+  ## Validate bg.prot.pars before touching anything else. An empty or
   ## malformed reference fitted-parameters list would otherwise surface as a
   ## confusing "subscript out of bounds" deep inside the foreach loop.
   if (is.null(bg.prot.pars) || !is.list(bg.prot.pars) ||
@@ -1265,7 +1302,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   metadata <- as.data.frame(metadata)
 
   ref_markers <- names(bg.prot.pars$markers)
-  ## T-5: explicit Ref/Query marker intersection check. .pad_to_features pads
+  ## Explicit Ref/Query marker intersection check. .pad_to_features pads
   ## with NA, so the matrix would survive even with zero overlap. Detect that
   ## case explicitly because it is almost always a metadata/panel mismatch.
   query_markers <- rownames(data_counts)
@@ -1446,8 +1483,8 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 #' Reference / query ADT normalisation
 #'
 #' Dispatcher around `.ADTprot_norm_ref()` / `.ADTprot_norm_query()` that
-#' enforces SLURM-aware parallelisation and the documented Mode C QC
-#' filters when invoked through `run_scProteinXpress()`.
+#' enforces SLURM-aware parallelisation and the documented QC filters when
+#' invoked through `run_scProteinXpress()`.
 #'
 #' @param data_counts proteins x cells matrix or Matrix.
 #' @param metadata data.frame; must contain `cell.id`, `sample`, `batch`.
@@ -1568,14 +1605,14 @@ ADTprot_norm <- function(data_counts,
 # Query prep for scProteinXpress
 # ----------------------------------------------------------------------------
 # Combines:
-#   - P2 (Mode C) global QC with audit CSV (current upload)
-#   - ncores propagation to ADTprot_norm (baseline _080526)
-#   - verbose = TRUE for ADTprot_norm calls (baseline)
+#   - Global QC with audit CSV
+#   - ncores propagation to ADTprot_norm
+#   - verbose = TRUE for ADTprot_norm calls
 ###############################################################################
 #' Prepare a query against an existing reference background
 #'
-#' Runs the Mode C global QC, ADTnorm query alignment to the Ref landmarks,
-#' and the compatibility scaleMaxGexp() step.
+#' Runs the global QC, ADTnorm query alignment to the Ref landmarks, and the
+#' compatibility scaleMaxGexp() step.
 #'
 #' @param query_dat proteins x cells matrix.
 #' @param query_metadata data.frame.
@@ -1588,7 +1625,7 @@ ADTprot_norm <- function(data_counts,
 #' @param normalise,scale_data,saveData,return.data logical switches.
 #' @param is_transformed NULL / TRUE / FALSE; see `run_scProteinXpress()`.
 #' @param sqs_threshold,apply_sqs SQS controls; see `run_scProteinXpress()`.
-#' @param min.cells.feature,min.coverage.fraction Mode C marker filter.
+#' @param min.cells.feature,min.coverage.fraction Marker-level coverage filter.
 #' @param qc_outlier_cells "no" / "yes"; resolved upstream.
 #' @param qc_nmads MAD threshold for scuttle::isOutlier.
 #' @param ncores integer >= 1.
@@ -1598,14 +1635,14 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
                               file.id = "query", bg.prot.pars, normalise = TRUE,
                               scale_data = TRUE, saveData = TRUE, return.data = TRUE,
                               is_transformed = NULL,
-                              ## T-4: aligned with the rest of the chain (none = off).
+                              ## Aligned with the rest of the chain (none = off).
                               sqs_threshold = 1.0, apply_sqs = "none",
-                              # P2: global coverage filters (Mode C)
+                              # Global coverage filters
                               min.cells.feature     = 10,
                               min.coverage.fraction = 0.10,
-                              # Opt-in cell outlier filter (D2 follow-up); resolved
-                              # upstream by run_scProteinXpress -- this function expects
-                              # the concrete "yes" / "no" string here.
+                              # Opt-in cell outlier filter, resolved upstream by
+                              # run_scProteinXpress -- this function expects the
+                              # concrete "yes" / "no" string here.
                               qc_outlier_cells = c("no", "yes"),
                               qc_nmads = 3,
                               # Parallelisation forwarded to ADTprot_norm
@@ -1618,7 +1655,7 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
   cat("Preparing ADT data: QC + ADTnorm query normalization + compatibility scaling\n",
       file = log.file, append = TRUE)
 
-  # P2: single global QC with audit CSV (no per-dataset partial filters here).
+  # Single global QC with audit CSV (no per-dataset partial filters here).
   qc <- cleanData_ADT(query_dat, nmads = qc_nmads,
                       min.cells.feature     = min.cells.feature,
                       min.coverage.fraction = min.coverage.fraction,
@@ -1653,7 +1690,7 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
   }
 
   if (!is.data.frame(sfback)) {
-    ## T-5: defensive read of _sf.txt. The file is a 2-column whitespace-
+    ## Defensive read of _sf.txt. The file is a 2-column whitespace-
     ## separated table written by GetBackground(). When absent, fall back to
     ## sf = 1 per feature (scaleMaxGexp is a no-op for sf == 1). When
     ## present but malformed, fail loudly so the caller knows the Ref dir
@@ -1715,11 +1752,11 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
 
 #' Quality-control filter for ADT count matrices
 #'
-#' Applies a Mode C / Option C marker-level filter (both an absolute
-#' non-zero-cell threshold and a coverage-fraction threshold), writes a
-#' per-marker exclusion audit CSV when one is requested, and optionally
-#' applies a cell-level outlier filter (scuttle::isOutlier on log10 total
-#' counts and on number of detected markers) before the marker filter.
+#' Applies a marker-level filter (both an absolute non-zero-cell threshold
+#' and a coverage-fraction threshold), writes a per-marker exclusion audit
+#' CSV when one is requested, and optionally applies a cell-level outlier
+#' filter (scuttle::isOutlier on log10 total counts and on number of
+#' detected markers) before the marker filter.
 #'
 #' @param data_counts proteins x cells numeric matrix.
 #' @param nmads number of MADs for the scuttle cell-outlier filter.
@@ -1739,7 +1776,7 @@ cleanData_ADT <- function(data_counts, nmads = 3,
                           audit_csv_path = NULL,
                           qc_outlier_cells = c("no", "yes")){
   qc_outlier_cells <- match.arg(qc_outlier_cells)
-  ## T-5: argument sanity checks. Returning an empty matrix on bad input
+  ## Argument sanity checks. Returning an empty matrix on bad input
   ## would surface as confusing downstream errors (e.g. `nrow == 0` deep
   ## inside ADTprot_norm). Fail at the QC boundary instead.
   if (!is.numeric(min.cells.feature) || min.cells.feature < 1L) {
@@ -1881,7 +1918,20 @@ swap_th <- function(th_dist){
   lapply(th_dist, function(x) if (x[1] > x[2]) c(x[2], x[1]) else c(x[1], x[2]))
 }
 
-createThresholdDist <- function(gexp){
+#' Rectangle-maximisation threshold (original scGeneXpress-derived heuristic)
+#'
+#' Finds the x that maximises x*(1-F(x)) (low cut) and F(x)*(max-x) (high
+#' cut) on the empirical CDF of the pooled marker values. This is a single-
+#' curve heuristic: it does not model the negative/positive (/intermediate)
+#' populations explicitly, so for two populations that are close together
+#' it can place both cuts on the same side of the true crossing point (see
+#' `createThresholdDist_mixture()` benchmark in
+#' `tests/testthat/test-threshold-mixture.R`), and for a genuinely bimodal
+#' (2-population) marker it still always returns two distinct thresholds,
+#' manufacturing a "medium" band that may not correspond to any real cell
+#' state.
+#' @noRd
+createThresholdDist_rectangle <- function(gexp){
   gexp <- as.numeric(gexp)
   gexp <- gexp[is.finite(gexp)]
   if (length(gexp) == 0) return(c(0, 0))
@@ -1891,10 +1941,145 @@ createThresholdDist <- function(gexp){
   minimizeRectangle(ecdf(gexp), maxv, minv)
 }
 
-GetThresholds <- function(processed.back, file.id){
+#' Mixture-model threshold: Bayes decision boundaries between fitted modes
+#'
+#' Fits a 1-3 component univariate Gaussian mixture (`mclust`, BIC-selected
+#' G unless `G` is fixed) to the pooled marker values and returns the
+#' crossing point(s) between adjacent weighted component densities -- the
+#' actual Bayes-optimal decision boundary under the fitted mixture, which is
+#' what "minimizes the theoretical rate of false-positive/false-negative
+#' classifications" literally means (the rectangle heuristic approximates
+#' this without fitting components at all).
+#'
+#' Falls back to `createThresholdDist_rectangle()` when: `mclust` is
+#' unavailable, there are fewer than `min_n` finite values, the fit errors,
+#' or BIC selects a single component (nothing to separate). For a
+#' 2-component fit, both returned cuts equal the single crossing point
+#' (no natural "medium" band exists for a strictly bimodal marker); for a
+#' 3-component fit, the two cuts are the (1|2) and (2|3) crossings.
+#'
+#' @param gexp Numeric vector of pooled marker values for one bootstrap draw.
+#' @param G Integer vector of candidate component counts passed to
+#'   `mclust::Mclust` (default `1:3`, matching the low/medium/high design).
+#' @param min_n Minimum number of finite values required to attempt a fit;
+#'   below this, falls back to the rectangle heuristic (mixture fits are
+#'   unstable on very small bootstrap draws).
+#' @return `c(lowThr, highThr)`, unsorted (swapped by `swap_th()` downstream
+#'   as with the rectangle method).
+#' @noRd
+createThresholdDist_mixture <- function(gexp, G = 1:3, min_n = 30){
+  gexp <- as.numeric(gexp)
+  gexp <- gexp[is.finite(gexp)]
+  if (length(gexp) < min_n || length(unique(gexp)) < 3 ||
+      !requireNamespace("mclust", quietly = TRUE)) {
+    return(createThresholdDist_rectangle(gexp))
+  }
+  fit <- tryCatch(
+    mclust::Mclust(gexp, G = G, verbose = FALSE, modelNames = "V"),
+    error = function(e) NULL
+  )
+  if (is.null(fit) || fit$G == 1) {
+    return(createThresholdDist_rectangle(gexp))
+  }
+
+  pars <- fit$parameters
+  mu   <- as.numeric(pars$mean)
+  sig2 <- as.numeric(pars$variance$sigmasq)
+  if (length(sig2) == 1) sig2 <- rep(sig2, fit$G)
+  sig  <- sqrt(sig2)
+  pro  <- as.numeric(pars$pro)
+  ord  <- order(mu); mu <- mu[ord]; sig <- sig[ord]; pro <- pro[ord]
+
+  .crossing <- function(i, j) {
+    f <- function(x) pro[i] * stats::dnorm(x, mu[i], sig[i]) - pro[j] * stats::dnorm(x, mu[j], sig[j])
+    tryCatch(stats::uniroot(f, lower = mu[i], upper = mu[j])$root,
+             error = function(e) mean(c(mu[i], mu[j])))
+  }
+
+  if (fit$G == 2) {
+    cut <- .crossing(1, 2)
+    return(c(cut, cut))
+  }
+  c(.crossing(1, 2), .crossing(2, 3))
+}
+
+#' Quantile threshold baseline
+#'
+#' The simplest possible reference-informed baseline: call "low" below the
+#' `low_q` quantile and "high" above the `high_q` quantile of the pooled/
+#' bootstrapped reference values, with no bootstrap-distribution machinery
+#' and no BH correction downstream. Exists so R1-Major4 can be answered
+#' directly: rerun the SAME reference/query pipeline with
+#' `threshold_method = "quantile"` and compare recall/precision against
+#' `"rectangle"`/`"mixture"` on identical data, isolating whether
+#' scProtXpress's advantage comes from the reference itself or from the
+#' specific bootstrap/discretisation machinery.
+#' @param gexp Numeric vector of pooled marker values for one bootstrap draw.
+#' @param low_q,high_q Quantiles (default 10th/90th percentile).
+#' @return `c(lowThr, highThr)`.
+#' @noRd
+createThresholdDist_quantile <- function(gexp, low_q = 0.10, high_q = 0.90){
+  gexp <- as.numeric(gexp)
+  gexp <- gexp[is.finite(gexp)]
+  if (length(gexp) == 0) return(c(0, 0))
+  if (length(gexp) == 1) return(c(gexp, gexp))
+  stats::quantile(gexp, probs = c(low_q, high_q), names = FALSE, type = 7)
+}
+
+#' Z-score threshold baseline
+#'
+#' `c(mean - k*sd, mean + k*sd)` of the pooled/bootstrapped reference
+#' values, clamped to the observed data range so it never proposes a
+#' threshold outside what was actually measured. Second of the two simple
+#' baselines requested for R1-Major4 (see `createThresholdDist_quantile()`).
+#' @param gexp Numeric vector of pooled marker values for one bootstrap draw.
+#' @param k Number of standard deviations (default 1).
+#' @return `c(lowThr, highThr)`.
+#' @noRd
+createThresholdDist_zscore <- function(gexp, k = 1){
+  gexp <- as.numeric(gexp)
+  gexp <- gexp[is.finite(gexp)]
+  if (length(gexp) == 0) return(c(0, 0))
+  if (length(gexp) == 1) return(c(gexp, gexp))
+  m <- mean(gexp); s <- stats::sd(gexp)
+  if (!is.finite(s) || s == 0) return(c(m, m))
+  lo <- max(m - k * s, min(gexp))
+  hi <- min(m + k * s, max(gexp))
+  c(lo, hi)
+}
+
+#' Dispatcher used by GetThresholds(); kept name-stable for back-compat.
+#' `method = "rectangle"` reproduces the original behaviour exactly.
+#' `method = "mixture"` uses `createThresholdDist_mixture()`.
+#' `method = "quantile"`/`"zscore"` use the two simple baselines added for
+#' R1-Major4 (see `createThresholdDist_quantile()`/`createThresholdDist_zscore()`).
+#' @noRd
+createThresholdDist <- function(gexp, method = c("rectangle", "mixture", "quantile", "zscore"), ...){
+  method <- match.arg(method)
+  switch(method,
+    mixture  = createThresholdDist_mixture(gexp, ...),
+    quantile = createThresholdDist_quantile(gexp, ...),
+    zscore   = createThresholdDist_zscore(gexp, ...),
+    createThresholdDist_rectangle(gexp)
+  )
+}
+
+#' Per-marker threshold estimation over a bootstrap draw
+#'
+#' Dispatches each marker's pooled/resampled values to `createThresholdDist()`
+#' and sorts the resulting (Lower, Upper) pair. Called once per bootstrap
+#' iteration by `RunBootstrap()`.
+#' @param threshold_method one of "rectangle" (default; original behaviour,
+#'   bit-for-bit identical to pre-existing releases) or "mixture" (fits a
+#'   1-3 component Gaussian mixture per bootstrap draw and uses the Bayes
+#'   decision boundary; see `createThresholdDist_mixture()`). Threaded down
+#'   from `run_scProteinXpress(threshold_method = ...)`.
+#' @noRd
+GetThresholds <- function(processed.back, file.id, threshold_method = c("rectangle", "mixture", "quantile", "zscore")){
+  threshold_method <- match.arg(threshold_method)
   check <- names(which(sapply(processed.back, length) < 1))
   if (length(check) > 0) processed.back <- processed.back[setdiff(names(processed.back), check)]
-  th_list <- lapply(processed.back, createThresholdDist)
+  th_list <- lapply(processed.back, createThresholdDist, method = threshold_method)
   th_list <- swap_th(th_list)
   names(th_list) <- names(processed.back)
   th_list
@@ -2196,22 +2381,22 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
 # .RunBackComputations_fast
 # -----------------------------------------------------------------------------
 
-.RunBackComputations_fast <- function(precomp, ncells.sample, file.id) {
+.RunBackComputations_fast <- function(precomp, ncells.sample, file.id,
+                                      threshold_method = "rectangle") {
   sampled.back <- .Background_sampling_fast(precomp, ncells.sample)
-  GetThresholds(processed.back = sampled.back, file.id = file.id)
+  GetThresholds(processed.back = sampled.back, file.id = file.id,
+               threshold_method = threshold_method)
 }
 
 # -----------------------------------------------------------------------------
-# .SampleBackground_pooled  (T-7.2)
+# .SampleBackground_pooled
 #
-# Unstratified per-marker bootstrap sampler. Mirrors the SampleBackground()
-# function shipped in the CITE-seq pipeline before Hito 2 T-3
-# (codebase/internalFunctions.R lines 2018-2040 at commit 56d3fd9), which
-# in turn mirrors the active path of the scGeneXpress reference
-# implementation (`internalFunctions.R:338-345` of scGeneXpress-main):
-# for each marker, draw `ncells.sample` values with replacement from the
-# pool of finite values across all cells. `clusterids_vec` is intentionally
-# absent here -- this branch does not stratify.
+# Unstratified per-marker bootstrap sampler, mirroring the active path of
+# the scGeneXpress reference implementation
+# (`internalFunctions.R:338-345` of scGeneXpress-main): for each marker,
+# draw `ncells.sample` values with replacement from the pool of finite
+# values across all cells. `clusterids_vec` is intentionally absent here --
+# this branch does not stratify.
 #
 # Used by RunBootstrap() when bootstrap_stratify == "none".
 # -----------------------------------------------------------------------------
@@ -2228,17 +2413,19 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
   out
 }
 
-.RunBackComputations_pooled <- function(norm.data, ncells.sample, file.id) {
+.RunBackComputations_pooled <- function(norm.data, ncells.sample, file.id,
+                                        threshold_method = "rectangle") {
   sampled.back <- .SampleBackground_pooled(norm.data, ncells.sample)
-  GetThresholds(processed.back = sampled.back, file.id = file.id)
+  GetThresholds(processed.back = sampled.back, file.id = file.id,
+               threshold_method = threshold_method)
 }
 # -----------------------------------------------------------------------------
 # RunBootstrap (optimized version)
 # -----------------------------------------------------------------------------
 #' Bootstrap per-marker threshold distributions
 #'
-#' Two-mode bootstrap. `bootstrap_stratify == "none"` (default since T-7)
-#' samples each marker from the global pool of finite values across cells
+#' Two-mode bootstrap. `bootstrap_stratify == "none"` (default) samples
+#' each marker from the global pool of finite values across cells
 #' with replacement, matching the scGeneXpress active path. The
 #' `"cell.type"` and `"cell.type_tissue"` modes stratify by the matching
 #' metadata columns using a one-shot precompute + per-iteration
@@ -2263,8 +2450,10 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
 #' @export
 RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
                          sample_n, parallelize, ncores, num.boot.sample, fixseed,
-                         bootstrap_stratify = c("none", "cell.type", "cell.type_tissue")){
+                         bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
+                         threshold_method = c("rectangle", "mixture", "quantile", "zscore")){
   bootstrap_stratify <- match.arg(bootstrap_stratify)
+  threshold_method   <- match.arg(threshold_method)
   data_norm <- .as_dense_matrix(data_norm)
   set.seed(fixseed)
   cl <- NULL
@@ -2308,7 +2497,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
     Sys.setenv(OPENBLAS_NUM_THREADS = "1")
   }
   
-  # --- PRECOMPUTATION: only in stratified branches (T-7.3) -------------------
+  # --- PRECOMPUTATION: only in stratified branches -------------------
   # bootstrap_stratify == "none" operates on `data_norm` directly (global
   # pool per marker), so there is nothing to precompute and `data_norm`
   # must remain alive when we enter the foreach.
@@ -2434,18 +2623,20 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
   t_boot <- proc.time()
   th_list <- foreach::foreach(
     n = 1:num.boot.sample,
-    .packages = c("Matrix"),
+    .packages = c("Matrix", if (identical(threshold_method, "mixture")) "mclust"),
     .export   = c(".sample_data_fast", ".Background_sampling_fast",
                   ".RunBackComputations_fast",
                   ".SampleBackground_pooled", ".RunBackComputations_pooled",
                   ".optLowFun", ".optHighFun",
-                  "minimizeRectangle", "createThresholdDist", "swap_th",
-                  "GetThresholds")
+                  "minimizeRectangle", "createThresholdDist",
+                  "createThresholdDist_rectangle", "createThresholdDist_mixture",
+                  "createThresholdDist_quantile", "createThresholdDist_zscore",
+                  "swap_th", "GetThresholds")
   ) %OP% {
     if (bootstrap_stratify == "none") {
-      .RunBackComputations_pooled(data_norm, sample_n, file.id)
+      .RunBackComputations_pooled(data_norm, sample_n, file.id, threshold_method = threshold_method)
     } else {
-      .RunBackComputations_fast(precomp, sample_n, file.id)
+      .RunBackComputations_fast(precomp, sample_n, file.id, threshold_method = threshold_method)
     }
   }
   message(sprintf("[TIMING][bootstrap] foreach elapsed: %.2fs",
@@ -2483,17 +2674,28 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
 #'   "cell.type_tissue". See `run_scProteinXpress()` for semantics.
 #'   `"cell.type_tissue"` requires a `tissue` column in `metadata`;
 #'   falls back to `"cell.type"` with a warning otherwise.
+#' @param threshold_method one of "rectangle" (default, original behaviour)
+#'   or "mixture" (Bayes decision boundary from a fitted 1-3 component
+#'   Gaussian mixture per bootstrap draw; requires the `mclust` package).
 #' @return list of per-marker threshold matrices.
 #' @export
 GetBackground <- function(data_norm, dir_name, file.id, metadata, sample_n, parallelize, ncores, num.boot.sample, fixseed,
-                          bootstrap_stratify = c("none", "cell.type", "cell.type_tissue")){
+                          bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
+                          threshold_method   = c("rectangle", "mixture", "quantile", "zscore")){
   bootstrap_stratify <- match.arg(bootstrap_stratify)
+  threshold_method   <- match.arg(threshold_method)
+  if (identical(threshold_method, "mixture") && !requireNamespace("mclust", quietly = TRUE)) {
+    warning("GetBackground: threshold_method = 'mixture' requested but the ",
+            "'mclust' package is not installed; falling back to 'rectangle' ",
+            "for every marker (createThresholdDist_mixture() degrades ",
+            "gracefully per-call, but installing mclust is recommended).",
+            call. = FALSE)
+  }
   data_norm <- .as_dense_matrix(data_norm)
 
-  ## T-7.4: explicit resolution of `clusterids_vec` from
-  ## `bootstrap_stratify`. Replaces the previous heuristic
-  ## (presence/absence of `tissue`) with a user-driven
-  ## decision.
+  ## Explicit resolution of `clusterids_vec` from `bootstrap_stratify`,
+  ## driven by the user's choice rather than an implicit heuristic based on
+  ## presence/absence of `tissue`.
   if (identical(bootstrap_stratify, "cell.type_tissue") &&
       !all(c("cell.type", "tissue") %in% colnames(metadata))) {
     warning("GetBackground: requested cell.type_tissue stratification but ",
@@ -2514,9 +2716,67 @@ GetBackground <- function(data_norm, dir_name, file.id, metadata, sample_n, para
   utils::write.table(data.frame(feature = feats, sf = sf_vec), file = file.path(dir_name, paste0(file.id, "_sf.txt")), sep = " ", row.names = FALSE, col.names = FALSE, quote = FALSE)
 
   back.thrs <- RunBootstrap(data_norm, dir_name, file.id, clusterids_vec, metadata, sample_n, parallelize, ncores, num.boot.sample, fixseed,
-                            bootstrap_stratify = bootstrap_stratify)
+                            bootstrap_stratify = bootstrap_stratify,
+                            threshold_method   = threshold_method)
   saveRDS(back.thrs, file.path(dir_name, paste0(file.id, "_th_dist.rds")))
+
+  ## Provenance sidecar: records the parameters that actually determined
+  ## this reference, independent of what any driver script's comments say.
+  ## Written every time GetBackground() runs so a stale/mismatched run is
+  ## always self-documenting on disk.
+  .write_provenance(dir_name, file.id,
+                    bootstrap_stratify = bootstrap_stratify,
+                    threshold_method   = threshold_method,
+                    num.boot.sample    = num.boot.sample,
+                    sample_n           = sample_n,
+                    fixseed            = fixseed)
   back.thrs
+}
+
+#' Write a provenance sidecar (`<file.id>_provenance.json`, falling back to
+#' `.txt` if `jsonlite` is unavailable) recording the exact parameters used
+#' to build a reference, the package version, and (when available) the git
+#' commit of the working directory the call was made from. This exists
+#' because `bootstrap_stratify` (and now `threshold_method`) silently
+#' resolve to a default when a driver script doesn't pass them explicitly
+#' -- this file makes the *effective* choice visible on disk next to the
+#' outputs it produced, rather than only in whatever driver script happened
+#' to be used.
+#' @noRd
+.write_provenance <- function(dir_name, file.id, ...){
+  params <- list(...)
+  pkg_version <- tryCatch(as.character(utils::packageVersion("scProtXpress")),
+                          error = function(e) NA_character_)
+  git_commit <- tryCatch({
+    out <- suppressWarnings(system("git rev-parse HEAD 2>/dev/null", intern = TRUE))
+    if (length(out) == 1 && !grepl("fatal", out)) out else NA_character_
+  }, error = function(e) NA_character_)
+
+  record <- c(
+    list(
+      file.id             = file.id,
+      timestamp_utc       = format(Sys.time(), tz = "UTC", usetz = TRUE),
+      scProtXpress_version = pkg_version,
+      git_commit          = git_commit,
+      r_version           = R.version.string
+    ),
+    params
+  )
+
+  path_json <- file.path(dir_name, paste0(file.id, "_provenance.json"))
+  ok <- FALSE
+  if (requireNamespace("jsonlite", quietly = TRUE)) {
+    ok <- tryCatch({
+      writeLines(jsonlite::toJSON(record, auto_unbox = TRUE, pretty = TRUE), path_json)
+      TRUE
+    }, error = function(e) FALSE)
+  }
+  if (!ok) {
+    path_txt <- file.path(dir_name, paste0(file.id, "_provenance.txt"))
+    lines <- vapply(names(record), function(nm) sprintf("%s: %s", nm, paste(record[[nm]], collapse = ",")), character(1))
+    writeLines(lines, path_txt)
+  }
+  invisible(record)
 }
 
 compute_pval <- function(th_list, gexp_mat, genes, p_correct = TRUE){
@@ -2571,13 +2831,23 @@ classify <- function(sig_vals, th, th_i){
 #' @param file.id character(1) used as filename prefix.
 #' @param outdir Output directory.
 #' @param return.data,saveData logical switches.
+#' @param p_correct logical. Whether to BH-adjust the per-cell p-values
+#'   computed against the reference ECDFs before classifying. Default
+#'   `FALSE`, matching the pre-existing (previously hardcoded, now just
+#'   made explicit) behaviour and the discretisation framework of
+#'   scGeneXpress: per-cell BH correction over what is typically thousands
+#'   to millions of cells is extremely conservative and not where the
+#'   multiple-testing burden that matters actually lives. That burden is
+#'   at the *population-level* calling step (one test per protein per cell
+#'   type per condition) -- see `discrete.expr.levels()`'s new `fdr_method`
+#'   argument and `correct_across_scan()` for where to actually control it.
 #' @return list(discretised_data, significance).
 #' @export
-Discretise_data <- function(query_ScaledData, Ref_data, thsback = NA, th = 0.05, th_i = 0.05, file.id = "myquery", outdir = ".", return.data = TRUE, saveData = TRUE){
+Discretise_data <- function(query_ScaledData, Ref_data, thsback = NA, th = 0.05, th_i = 0.05, file.id = "myquery", outdir = ".", return.data = TRUE, saveData = TRUE, p_correct = FALSE){
   dir_name <- file.path(outdir, paste0("Query_", file.id))
   if (!dir.exists(dir_name)) dir.create(dir_name, recursive = TRUE)
   threshold.dist <- if (length(thsback) == 1) {
-    ## T-5: explicit guard around the implicit `_th_dist.rds` resolution.
+    ## Explicit guard around the implicit `_th_dist.rds` resolution.
     f <- list.files(Ref_data, pattern = "_th_dist\\.rds$", full.names = TRUE)
     if (length(f) != 1L) {
       stop(sprintf("Discretise_data: expected exactly one *_th_dist.rds in %s; found %d.",
@@ -2594,7 +2864,7 @@ Discretise_data <- function(query_ScaledData, Ref_data, thsback = NA, th = 0.05,
       "Discretise_data: no markers shared between query (n=%d) and threshold distributions (n=%d).",
       nrow(query_ScaledData), length(threshold.dist)))
   }
-  query_pvals <- compute_pval(threshold.dist, query_ScaledData, genes_common, FALSE)
+  query_pvals <- compute_pval(threshold.dist, query_ScaledData, genes_common, p_correct)
   saveRDS(query_pvals, file = file.path(dir_name, paste0(file.id, "_pvals.rds")))
   query_discretised <- classify(query_pvals, th, th_i)
   data <- list(discretised_data = query_discretised, significance = query_pvals)
@@ -2602,7 +2872,80 @@ Discretise_data <- function(query_ScaledData, Ref_data, thsback = NA, th = 0.05,
   if (return.data) return(data)
   invisible(NULL)
 }
-#' Per-gene signature frame with Mode C coverage filter
+#' Compute prob_low/prob_high from an INDEPENDENT population, not the one
+#' being tested
+#'
+#' `Create.sig.frame()` derives `prob_low`/`prob_high` -- the population-
+#' level binomial baselines used by `discrete.expr.levels()` -- entirely
+#' from the same discretised matrix that is about to be classified against
+#' them: it pools the non-zero/medium rate across every protein measured in
+#' THIS population, in THIS run. That means "is protein P enriched in
+#' population X" is tested against "how leaky/noisy is population X on
+#' average across ~150-700 other proteins", not against an independent
+#' healthy/reference expectation. Populations with a high baseline rate of
+#' non-specific antibody binding (platelets and erythroid cells are the
+#' textbook CITE-seq case) get an inflated baseline that makes it *harder*
+#' to call true enrichment there, while populations with low background
+#' make almost anything look enriched by comparison.
+#'
+#' This function computes the SAME baseline statistics `Create.sig.frame()`
+#' would, but from a caller-supplied independent discretised matrix (e.g.
+#' a designated healthy/reference cohort's version of the same population,
+#' or the Ref's own self-query) rather than from the query population
+#' itself. Pass the result into `discrete.expr.levels(prob_low = ,
+#' prob_high = )` (or `discrete.expr.levels_donor()`) for every disease
+#' population INSTEAD of re-deriving it per-population from itself.
+#'
+#' @param reference_discrete.mat proteins x cells discretised matrix from
+#'   an INDEPENDENT population/cohort (not the one being tested).
+#' @param min.coverage.fraction.sigframe As in `Create.sig.frame()`.
+#' @return list(prob_low, prob_high) -- pass straight through to
+#'   `discrete.expr.levels()`/`discrete.expr.levels_donor()`.
+#' @export
+ComputeExternalBaseline <- function(reference_discrete.mat, min.coverage.fraction.sigframe = 0.10){
+  sig <- Create.sig.frame(reference_discrete.mat,
+                          min.coverage.fraction.sigframe = min.coverage.fraction.sigframe)
+  list(prob_low = sig[[3]], prob_high = sig[[4]])
+}
+
+#' Isotype/negative-control-based background offset (optional refinement
+#' on top of `ComputeExternalBaseline()`)
+#'
+#' If the panel includes isotype or other negative-control ADTs, their
+#' non-zero rate in a given sample/population is a direct estimate of
+#' non-specific binding -- a more targeted background estimate than
+#' averaging across all real markers (which mixes in genuine biology).
+#' When available, blend it into `prob_low` as a floor: the population is
+#' never treated as having a lower expected background than its own
+#' isotype controls actually show.
+#'
+#' @param discrete.mat proteins x cells discretised matrix for the
+#'   population being tested (the SAME matrix passed to `Create.sig.frame`
+#'   for that population, not an external one -- isotype controls
+#'   estimate technical background per-sample, so they should come from the
+#'   population itself, unlike `ComputeExternalBaseline()`'s biological
+#'   baseline which should not).
+#' @param isotype_marker_names Character vector of rownames in
+#'   `discrete.mat` corresponding to isotype/negative-control ADTs.
+#' @param prob_low The externally- or self-derived prob_low to floor.
+#' @return Numeric: `max(prob_low, isotype non-zero rate)`.
+#' @export
+apply_isotype_floor <- function(discrete.mat, isotype_marker_names, prob_low){
+  present <- intersect(isotype_marker_names, rownames(discrete.mat))
+  if (length(present) == 0) {
+    warning("apply_isotype_floor: none of the requested isotype_marker_names ",
+            "are present in discrete.mat; returning prob_low unchanged.", call. = FALSE)
+    return(prob_low)
+  }
+  iso <- discrete.mat[present, , drop = FALSE]
+  n_nz  <- sum(iso > 0, na.rm = TRUE)
+  n_tot <- sum(!is.na(iso))
+  if (n_tot == 0) return(prob_low)
+  iso_rate <- n_nz / n_tot
+  max(prob_low, iso_rate)
+}
+
+#' Per-gene signature frame with coverage filter
 #'
 #' Returns a 5-element list:
 #' \enumerate{
@@ -2624,7 +2967,7 @@ Discretise_data <- function(query_ScaledData, Ref_data, thsback = NA, th = 0.05,
 Create.sig.frame <- function(discrete.mat,
                              min.coverage.fraction.sigframe = 0.10,
                              audit_csv_path = NULL){
-  ## T-5: argument sanity. `discrete.mat` must be a 0/0.5/1/NA matrix with
+  ## Argument sanity. `discrete.mat` must be a 0/0.5/1/NA matrix with
   ## rownames (markers). Anything else is a programming error upstream.
   if (!is.matrix(discrete.mat) && !inherits(discrete.mat, "Matrix")) {
     stop("Create.sig.frame: discrete.mat must be a matrix; got ",
@@ -2638,22 +2981,12 @@ Create.sig.frame <- function(discrete.mat,
       min.coverage.fraction.sigframe > 1) {
     stop("Create.sig.frame: min.coverage.fraction.sigframe must be in the range 0 to 1.")
   }
-  # Build a per-gene summary of a discretised matrix and pre-compute the
-  # population-wide binomial probabilities used by discrete.expr.levels().
-  #
-  # Output contract (list):
-  #   [[1]] sig.frame      enriched per-gene table
-  #   [[2]] z2             legacy z-score (kept for API back-compat)
-  #   [[3]] prob_low       binomial baseline for "non-zero rate"
-  #   [[4]] prob_high      binomial baseline for "0.5 rate among non-zero"
-  #   [[5]] excluded_genes character vector of genes excluded from prob_low/high
-  #
-  # Methodology (Mode C / Option C):
+  # Methodology:
   #   - prob_low / prob_high are computed ONLY over genes whose per-population
   #     coverage (n_observed / n_cells_in_pop) is >= min.coverage.fraction.sigframe.
   #     This protects the population-level baseline from being contaminated by
   #     markers that are technically present in the matrix (they passed the
-  #     global QC of P2) but happen to have very few observations in this
+  #     global QC step) but happen to have very few observations in this
   #     specific population due to multi-panel NA padding.
   #   - Every gene STILL receives its own call in discrete.expr.levels() against
   #     these sanitised probs, including those excluded from the prob calc.
@@ -2770,6 +3103,222 @@ Create.sig.frame <- function(discrete.mat,
 
   list(sig.frame, z2, prob_low, prob_high, excluded_genes)
 }
+#' Per-donor gene x donor count breakdown, for donor-aware population testing
+#'
+#' `Create.sig.frame()` pools every cell in a population regardless of which
+#' donor/sample it came from, so the downstream `pbinom` test in
+#' `discrete.expr.levels()` treats each CELL as an independent trial. Cells
+#' from the same donor are correlated (shared genotype, disease state,
+#' staining batch), so that test's false-positive rate inflates whenever
+#' there is real between-donor heterogeneity -- confirmed by simulation to
+#' reach 3-8x the nominal rate at ICC values (0.02-0.20) well within what is
+#' typically seen for immune cell-state proportions across donors, even
+#' though it is exactly nominal when donors are truly identical
+#' (`tests/testthat/test-calibration.R`).
+#'
+#' This function does NOT replace `Create.sig.frame()` -- it computes the
+#' same n.0/n.0.5/n.1 counts *broken out per donor* so that
+#' `discrete.expr.levels_donor()` can test across donors instead of across
+#' pooled cells. Everything else about the pipeline (thresholds,
+#' discretisation) is unchanged.
+#'
+#' @param discrete.mat proteins x cells discretised matrix (0/0.5/1/NA).
+#' @param donor_ids Character/factor vector of length `ncol(discrete.mat)`,
+#'   giving the donor/sample each cell belongs to. Must align positionally
+#'   with the columns of `discrete.mat`.
+#' @return list(n0, n05, n1): each a genes x donors integer matrix.
+#' @export
+Create.sig.frame_by_donor <- function(discrete.mat, donor_ids){
+  if (ncol(discrete.mat) != length(donor_ids)) {
+    stop("Create.sig.frame_by_donor: length(donor_ids) must equal ncol(discrete.mat).")
+  }
+  donor_ids <- as.character(donor_ids)
+  donors <- sort(unique(donor_ids))
+  genes  <- rownames(discrete.mat)
+
+  n0  <- matrix(0L, nrow = length(genes), ncol = length(donors), dimnames = list(genes, donors))
+  n05 <- n0; n1 <- n0
+
+  for (d in donors) {
+    sub <- discrete.mat[, donor_ids == d, drop = FALSE]
+    n0[,  d] <- rowSums(sub == 0,   na.rm = TRUE)
+    n05[, d] <- rowSums(sub == 0.5, na.rm = TRUE)
+    n1[,  d] <- rowSums(sub == 1,   na.rm = TRUE)
+  }
+  list(n0 = n0, n05 = n05, n1 = n1)
+}
+
+#' One-way ANOVA (Fleiss-Cuzick-style) estimator of the intra-donor
+#' correlation (ICC) for a binary/proportion outcome measured on cells
+#' clustered within donors, used by `discrete.expr.levels_donor(test_method
+#' = "design_effect")` to deflate the effective sample size before applying
+#' the package's existing `pbinom` test. Returns 0 (no correction, falls
+#' back to the original pooled behaviour) when there are fewer than 2
+#' donors or the between/within decomposition is degenerate.
+#' @noRd
+.estimate_icc <- function(nnz_per_donor, ntot_per_donor){
+  D <- length(ntot_per_donor)
+  if (D < 2) return(0)
+  n_tot <- sum(ntot_per_donor)
+  if (n_tot == 0) return(0)
+  p_d   <- nnz_per_donor / pmax(ntot_per_donor, 1)
+  p_bar <- sum(nnz_per_donor) / n_tot
+
+  MSB <- sum(ntot_per_donor * (p_d - p_bar)^2) / (D - 1)
+  MSW <- sum(ntot_per_donor * p_d * (1 - p_d)) / max(n_tot - D, 1)
+  n0  <- (n_tot - sum(ntot_per_donor^2) / n_tot) / (D - 1)
+
+  denom <- MSB + (n0 - 1) * MSW
+  icc <- if (is.finite(denom) && denom > 0) (MSB - MSW) / denom else 0
+  max(0, min(icc, 0.99))
+}
+
+#' Donor-aware alternative to the pooled-cell population test
+#'
+#' Same output contract and low/not.significant/medium/high cascade as
+#' `discrete.expr.levels()`, but the significance test is computed across
+#' donors rather than across pooled cells.
+#'
+#' @param by_donor Output of `Create.sig.frame_by_donor()`.
+#' @param prob_low,prob_high Population-level binomial baselines, as from
+#'   `Create.sig.frame()` (unchanged -- only the *test*, not the baseline
+#'   estimate, changes here; see `ComputeExternalBaseline()` if you also
+#'   want the baseline itself to stop being self-referential).
+#' @param test_method one of:
+#'   \itemize{
+#'     \item `"donor_t"` (default) -- one-sample t-test on arcsine-root
+#'       transformed per-donor proportions against `asin(sqrt(prob_low))`
+#'       (and analogously for the medium/high sub-test). Simplest to
+#'       explain ("we test across donors, not cells"); slightly
+#'       conservative at high ICC / many donors in simulation.
+#'     \item `"donor_wilcox"` -- Wilcoxon signed-rank version of the above;
+#'       avoids the normality assumption, useful with few donors or skewed
+#'       proportions.
+#'     \item `"design_effect"` -- keeps the exact pooled-cell `pbinom` test
+#'       from `discrete.expr.levels()`, but deflates `n`/`n_nz` by an
+#'       ANOVA-estimated design effect (`1 + (mean donor size - 1) * ICC`)
+#'       before applying it. Tracked closest to nominal across the widest
+#'       range of simulated ICC values in
+#'       `tests/testthat/test-calibration.R` and requires the smallest
+#'       conceptual change to the existing statistic.
+#'   }
+#'   Populations with fewer than 2 donors contributing non-NA cells for a
+#'   gene fall back to the original pooled `pbinom` test for that gene
+#'   (with a warning tally in the attributes of the returned table).
+#' @param min_donors_for_call Integer, default 2. Genes with fewer
+#'   contributing donors than this are forced to `"not.significant"`
+#'   rather than silently falling back to a pooled-cell test that offers no
+#'   real protection against pseudoreplication.
+#' @return data.frame: gene, per-donor-summed n.0/n.0.5/n.1 (for
+#'   comparability with `discrete.expr.levels()`'s output shape), n_donors,
+#'   p_low, p_high, expr.level.
+#' @export
+discrete.expr.levels_donor <- function(by_donor, prob_low, prob_high,
+                                       test_method = c("donor_t", "donor_wilcox", "design_effect"),
+                                       min_donors_for_call = 2L){
+  test_method <- match.arg(test_method)
+  if (prob_low  >= 1) prob_low  <- 1 - 1e-6
+  if (prob_high >= 1) prob_high <- 1 - 1e-6
+  if (prob_low  <= 0) prob_low  <- 1e-6
+  if (prob_high <= 0) prob_high <- 1e-6
+
+  genes <- rownames(by_donor$n0)
+  n_fallback <- 0L
+
+  .test_low <- function(nnz_d, ntot_d) {
+    switch(test_method,
+      donor_t = {
+        p_d <- nnz_d / ntot_d
+        y <- asin(sqrt(p_d)); mu0 <- asin(sqrt(prob_low))
+        if (length(p_d) < 2 || sd(y) == 0) return(NA_real_)
+        tryCatch(stats::t.test(y, mu = mu0, alternative = "greater")$p.value, error = function(e) NA_real_)
+      },
+      donor_wilcox = {
+        p_d <- nnz_d / ntot_d
+        if (length(p_d) < 2 || all(p_d == p_d[1])) return(NA_real_)
+        tryCatch(suppressWarnings(stats::wilcox.test(p_d, mu = prob_low, alternative = "greater")$p.value),
+                 error = function(e) NA_real_)
+      },
+      design_effect = {
+        icc <- .estimate_icc(nnz_d, ntot_d)
+        n_tot <- sum(ntot_d); m_bar <- mean(ntot_d)
+        deff  <- 1 + (m_bar - 1) * icc
+        n_eff   <- max(round(n_tot / deff), length(ntot_d))
+        nnz_eff <- round(sum(nnz_d) / n_tot * n_eff)
+        pbinom(max(nnz_eff - 1L, 0L), size = n_eff, prob = prob_low, lower.tail = FALSE)
+      }
+    )
+  }
+  ## Symmetric helper for the medium/high sub-test (tests the 0.5-share
+  ## among non-zero cells against prob_high, same three methods).
+  .test_high <- function(n05_d, nnz_d) {
+    if (sum(nnz_d) == 0) return(NA_real_)
+    keep <- nnz_d > 0
+    if (sum(keep) < 2) return(NA_real_)
+    switch(test_method,
+      donor_t = {
+        p_d <- n05_d[keep] / nnz_d[keep]
+        y <- asin(sqrt(p_d)); mu0 <- asin(sqrt(prob_high))
+        if (sd(y) == 0) return(NA_real_)
+        tryCatch(stats::t.test(y, mu = mu0, alternative = "greater")$p.value, error = function(e) NA_real_)
+      },
+      donor_wilcox = {
+        p_d <- n05_d[keep] / nnz_d[keep]
+        if (all(p_d == p_d[1])) return(NA_real_)
+        tryCatch(suppressWarnings(stats::wilcox.test(p_d, mu = prob_high, alternative = "greater")$p.value),
+                 error = function(e) NA_real_)
+      },
+      design_effect = {
+        icc <- .estimate_icc(n05_d[keep], nnz_d[keep])
+        n_tot <- sum(nnz_d[keep]); m_bar <- mean(nnz_d[keep])
+        deff  <- 1 + (m_bar - 1) * icc
+        n_eff   <- max(round(n_tot / deff), sum(keep))
+        n05_eff <- round(sum(n05_d[keep]) / n_tot * n_eff)
+        pbinom(max(n05_eff - 1L, 0L), size = n_eff, prob = prob_high, lower.tail = FALSE)
+      }
+    )
+  }
+
+  out <- lapply(genes, function(g) {
+    n0_d  <- by_donor$n0[g, ]; n05_d <- by_donor$n05[g, ]; n1_d <- by_donor$n1[g, ]
+    ntot_d <- n0_d + n05_d + n1_d
+    nnz_d  <- n05_d + n1_d
+    keep_d <- ntot_d > 0   # donors that actually contributed measured cells to this gene
+    n_donors <- sum(keep_d)
+
+    N0 <- sum(n0_d); N05 <- sum(n05_d); N1 <- sum(n1_d)
+    row <- data.frame(gene = g, n.0 = N0, n.0.5 = N05, n.1 = N1, n_donors = n_donors,
+                      stringsAsFactors = FALSE)
+
+    if (n_donors < min_donors_for_call) {
+      row$p_low <- NA_real_; row$p_high <- NA_real_; row$expr.level <- "not.significant"
+      return(row)
+    }
+
+    p_low  <- .test_low(nnz_d[keep_d], ntot_d[keep_d])
+    if (is.na(p_low)) { n_fallback <<- n_fallback + 1L; p_low <- 1 }
+    row$p_low <- p_low
+
+    if (p_low > 0.05 || (N05 + N1) == 0) {
+      row$p_high <- NA_real_; row$expr.level <- "low"; return(row)
+    }
+    if (N05 == N1) { row$p_high <- NA_real_; row$expr.level <- "not.significant"; return(row) }
+
+    p_high <- .test_high(n05_d[keep_d], nnz_d[keep_d])
+    if (is.na(p_high)) { n_fallback <<- n_fallback + 1L; p_high <- 1 }
+    row$p_high <- p_high
+    row$expr.level <- if (p_high < 0.05) "medium" else "high"
+    row
+  })
+  result <- do.call(rbind, out)
+  attr(result, "n_fallback_to_pooled") <- n_fallback
+  if (n_fallback > 0) {
+    message(sprintf("[discrete.expr.levels_donor] %d/%d genes had a degenerate donor test (e.g. all donors identical) and were scored NA/conservative; check attr(result, 'n_fallback_to_pooled').",
+                    n_fallback, length(genes)))
+  }
+  result
+}
+
 #' Assign per-gene expression levels with two binomial tests
 #'
 #' Vectorised one-sided `pbinom` (alternative = "greater") on each gene's
@@ -2785,9 +3334,37 @@ Create.sig.frame <- function(discrete.mat,
 #' @param tbl data.frame returned by `Create.sig.frame()` (element 1).
 #' @param zs Legacy z-score, ignored.
 #' @param prob_low,prob_high Numerics; per-population binomial baselines.
-#' @return The input data.frame with an added `expr.level` column.
+#' @param fdr_method NULL (default; original behaviour, `expr.level` is
+#'   thresholded on the raw one-sided p-values exactly as before) or "BH".
+#'   When "BH", `p_low`/`p_high` are Benjamini-Hochberg adjusted *across the
+#'   genes in `tbl`* before both the reported `q_low`/`q_high` columns and
+#'   the `expr.level` cutoff -- this controls the FDR within one
+#'   population's whole-panel scan. It does NOT correct across multiple
+#'   populations/diseases in a larger discovery run; use
+#'   `correct_across_scan()` for that, on the list of tables this function
+#'   returns.
+#' @param min_n_for_call Integer, default 0 (original behaviour: any n
+#'   yields a confident call, `"not.significant"` is only assigned on an
+#'   exact `n.0.5 == n.1` tie). When > 0, any gene with `ntot` (or `nnz`,
+#'   for the high/medium sub-test) below this value is additionally forced
+#'   to `"not.significant"` regardless of how the binomial test comes out,
+#'   since a handful of cells should not generate a confident population
+#'   call. Recommended: 20-50 depending on how much you trust small
+#'   populations in your data.
+#' @param effect_size logical, default `TRUE`. Adds `effect_size_low`
+#'   (`nnz/ntot - prob_low`) and `effect_size_high` (`n.0.5/nnz -
+#'   prob_high`, `NA` when `nnz == 0`) columns -- purely additive, does not
+#'   change `expr.level`. Lets you rank/filter calls by strength rather
+#'   than only by the categorical label: two "high" calls are not equally
+#'   strong evidence.
+#' @return The input data.frame with `expr.level` plus (new, additive)
+#'   `p_low`, `p_high` (previously computed then discarded), and, per the
+#'   arguments above, `q_low`/`q_high` and/or `effect_size_low`/
+#'   `effect_size_high`.
 #' @noRd
-discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL){
+discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL,
+                                 fdr_method = NULL, min_n_for_call = 0L,
+                                 effect_size = TRUE){
   # Per-gene call using two binomial tests:
   #   bt_low : P(non-zero >= n_nz | n_total, prob_low),  alternative="greater"
   #            -> rejects "low" if the gene has more non-zero cells than expected.
@@ -2798,6 +3375,13 @@ discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL){
   # supplied, recovers them from the table itself for backward compatibility.
 
   if (nrow(tbl) == 0) { tbl$expr.level <- character(0); return(tbl) }
+
+  if (!is.null(fdr_method) && !identical(fdr_method, "BH")) {
+    stop('discrete.expr.levels: fdr_method must be NULL or "BH".')
+  }
+  if (!is.numeric(min_n_for_call) || min_n_for_call < 0) {
+    stop("discrete.expr.levels: min_n_for_call must be a non-negative integer.")
+  }
 
   if (is.null(prob_low) || is.null(prob_high)){
     N0  <- sum(tbl$n.0)
@@ -2827,8 +3411,26 @@ discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL){
                           prob = prob_high, lower.tail = FALSE),
                    NA_real_)
 
+  ## --- new, additive: raw p-values were computed above then silently
+  ## discarded in every prior release; keep them, and BH-adjust across the
+  ## gene panel in `tbl` when requested. `cutoff_low`/`cutoff_high` are what
+  ## `is_low`/`med` are actually thresholded against below -- 0.05 on the
+  ## raw p when fdr_method is NULL (byte-identical to the original), or the
+  ## BH q-value when fdr_method = "BH".
+  if (identical(fdr_method, "BH")) {
+    q_low  <- stats::p.adjust(p_low,  method = "BH")
+    q_high <- stats::p.adjust(p_high, method = "BH")
+    cutoff_low  <- q_low
+    cutoff_high <- q_high
+  } else {
+    q_low  <- rep(NA_real_, length(p_low))
+    q_high <- rep(NA_real_, length(p_high))
+    cutoff_low  <- p_low
+    cutoff_high <- p_high
+  }
+
   lvl <- character(length(nnz))
-  is_low <- (nnz == 0) | (p_low > 0.05)
+  is_low <- (nnz == 0) | (cutoff_low > 0.05)
   lvl[is_low] <- "low"
 
   rest <- !is_low
@@ -2837,12 +3439,649 @@ discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL){
     lvl[tied] <- "not.significant"
     rest2 <- rest & !tied
     if (any(rest2)){
-      med <- rest2 & (p_high < 0.05)
+      med <- rest2 & (cutoff_high < 0.05)
       lvl[med]            <- "medium"
       lvl[rest2 & !med]   <- "high"
     }
   }
 
+  ## --- new, additive: force "not.significant" for populations too small
+  ## to support a confident call. OFF by default (min_n_for_call = 0L),
+  ## so default output is unchanged. Previously the ONLY way to get
+  ## "not.significant" was an exact n.0.5 == n.1 tie -- e.g. one 0.5-cell
+  ## and one 1-cell out of two total non-zero cells got the same
+  ## "not.significant" status as a genuine coin-flip, but two non-zero
+  ## cells that happened not to tie got a full-confidence "high"/"medium"
+  ## call. This makes the *minimum evidence* required explicit instead.
+  if (min_n_for_call > 0L) {
+    too_small <- (ntot < min_n_for_call) | (nnz > 0 & nnz < min_n_for_call)
+    lvl[too_small] <- "not.significant"
+  }
+
   tbl$expr.level <- lvl
+  tbl$p_low  <- p_low
+  tbl$p_high <- p_high
+  if (identical(fdr_method, "BH")) {
+    tbl$q_low  <- q_low
+    tbl$q_high <- q_high
+  }
+  if (isTRUE(effect_size)) {
+    tbl$effect_size_low  <- (nnz / ntot) - prob_low
+    tbl$effect_size_high <- ifelse(nnz > 0, (n05 / nnz) - prob_high, NA_real_)
+  }
   tbl
+}
+
+#' Re-adjust p-values for FDR control across an entire discovery scan
+#'
+#' `discrete.expr.levels()` (optionally with `fdr_method = "BH"`) controls
+#' the false discovery rate *within one population's gene panel*. A full
+#' biomarker-discovery run tests many (protein x cell type x disease)
+#' combinations -- e.g. the manuscript's disease panel applies scProtXpress
+#' to 701 proteins across multiple cell types and diseases, which is
+#' thousands of individual tests, each with its own within-table BH
+#' correction (or none, by default) but nothing correcting *across* tables.
+#' This function takes the list of per-population tables produced across a
+#' run (e.g. every `sig_tbl.txt` written to `sig_frames/`) and re-adjusts
+#' `p_low`/`p_high` jointly across all of them, adding `q_low_global`/
+#' `q_high_global` and an `expr.level_global` column that reflects the
+#' scan-wide FDR rather than the single-population FDR.
+#'
+#' @param sig_tbl_list Named list of data.frames as returned by
+#'   `discrete.expr.levels()` (each must have `gene`, `p_low`, `p_high`,
+#'   `n.0`, `n.0.5`, `n.1`); names are used as a `population` label in the
+#'   combined output.
+#' @param method `p.adjust` method, default `"BH"`.
+#' @return A single combined data.frame (one row per gene x population)
+#'   with `population`, the original columns, `q_low_global`,
+#'   `q_high_global`, and `expr.level_global`.
+#' @export
+correct_across_scan <- function(sig_tbl_list, method = "BH"){
+  if (length(sig_tbl_list) == 0) stop("correct_across_scan: sig_tbl_list is empty.")
+  missing_cols <- vapply(sig_tbl_list, function(x) !all(c("p_low", "p_high") %in% colnames(x)), logical(1))
+  if (any(missing_cols)) {
+    stop("correct_across_scan: every table must have p_low/p_high columns ",
+         "(i.e. must come from a discrete.expr.levels() call, which reports p_low/p_high ",
+         "alongside expr.level). ",
+         "Offending tables: ", paste(names(sig_tbl_list)[missing_cols], collapse = ", "))
+  }
+  if (is.null(names(sig_tbl_list)) || any(names(sig_tbl_list) == "")) {
+    names(sig_tbl_list) <- paste0("population_", seq_along(sig_tbl_list))
+  }
+  combined <- do.call(rbind, lapply(names(sig_tbl_list), function(nm) {
+    df <- sig_tbl_list[[nm]]
+    df$population <- nm
+    df
+  }))
+  combined$q_low_global  <- stats::p.adjust(combined$p_low,  method = method)
+  combined$q_high_global <- stats::p.adjust(combined$p_high, method = method)
+
+  ## Recompute expr.level under the global correction, preserving the same
+  ## decision cascade as discrete.expr.levels() (low -> tie -> medium/high).
+  nnz <- combined$n.0.5 + combined$n.1
+  n05 <- combined$n.0.5; n1 <- combined$n.1
+  lvl <- character(nrow(combined))
+  is_low <- (nnz == 0) | (combined$q_low_global > 0.05)
+  lvl[is_low] <- "low"
+  rest <- !is_low
+  tied <- rest & (n05 == n1)
+  lvl[tied] <- "not.significant"
+  rest2 <- rest & !tied
+  med <- rest2 & (combined$q_high_global < 0.05)
+  lvl[med] <- "medium"
+  lvl[rest2 & !med] <- "high"
+  combined$expr.level_global <- lvl
+  combined
+}
+
+#' Area under the ROC curve via the Mann-Whitney U statistic
+#'
+#' Exact, dependency-free AUC (no `pROC`/`ROCR` import needed): the
+#' well-known identity AUC = (sum of positive-class ranks - n_pos*(n_pos+1)/2)
+#' / (n_pos * n_neg). Ties are handled by `rank()`'s default averaging.
+#' @param scores Numeric predicted scores/probabilities.
+#' @param labels Logical or 0/1 vector, same length as `scores`; `TRUE`/`1`
+#'   is the positive class.
+#' @return Numeric AUC in [0, 1], or `NA` if either class is empty.
+#' @noRd
+.compute_auc <- function(scores, labels){
+  labels <- as.logical(labels)
+  pos <- scores[labels]; neg <- scores[!labels]
+  n_pos <- length(pos); n_neg <- length(neg)
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+  r <- rank(c(pos, neg))
+  r_pos <- sum(r[seq_len(n_pos)])
+  (r_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+#' Cross-validated patient-level classifier
+#'
+#' A minimal proof-of-concept classifier for the clinical-translation case:
+#' given per-patient summary features (e.g. the proportion of biomarker-
+#' positive cells per patient, from `discrete.expr.levels_donor()`'s
+#' by-donor breakdown, or any other per-patient numeric summary you
+#' compute) and a binary disease label, fits a logistic regression with
+#' leave-one-out (default -- appropriate for the small cohorts typical of
+#' these studies, e.g. n=28/29) or k-fold cross-validation, and reports
+#' out-of-fold AUC, sensitivity, and specificity. This is explicitly a
+#' proof-of-concept tool, not a validated diagnostic -- report it as such.
+#'
+#' @section Small-sample AUC bias -- read before using:
+#' Cross-validated AUC computed by pooling out-of-fold predictions (the only
+#' option for leave-one-out, where each fold has one held-out point) is
+#' NOT centered on 0.5 under a true null for small, weakly- or non-
+#' predictive cohorts -- it is biased downward, and the bias gets WORSE as
+#' the method gets closer to leave-one-out. For example, at n=40 with a
+#' single pure-noise predictor, mean AUC across 60 null draws was 0.33 for
+#' LOO, 0.40 for 10-fold, and 0.45 for 3-fold -- all below the naively-
+#' expected 0.5. This is a property of small-sample cross-validated AUC
+#' generally, not a bug specific to this implementation. **Do not compare
+#' an observed AUC to 0.5 as the null expectation for a small cohort.**
+#' Use `n_permutations > 0` (below) to get the actual null distribution
+#' FOR YOUR data's sample size and CV settings, and report the resulting
+#' permutation p-value instead of (or alongside) the raw AUC.
+#'
+#' @param patient_features data.frame or matrix, one row per patient, one
+#'   or more numeric predictor columns (e.g. per-patient proportions of one
+#'   or more candidate biomarkers).
+#' @param labels Vector aligned to the rows of `patient_features`: logical,
+#'   0/1, or a two-level factor/character (the second sorted level, or
+#'   `TRUE`/`1`, is treated as the positive/disease class).
+#' @param cv_method "loo" (default; leave-one-patient-out) or "kfold".
+#' @param k Number of folds when `cv_method = "kfold"` (default 5; ignored
+#'   for "loo"). Smaller `k` shows less of the small-sample AUC bias
+#'   described above, at the cost of a coarser model per fold.
+#' @param threshold Probability cutoff for sensitivity/specificity/the
+#'   confusion matrix (default 0.5). AUC does not depend on this.
+#' @param fixseed Seed for the k-fold split and for permutations.
+#' @param n_permutations Integer, default 0 (off). When > 0, repeats the
+#'   ENTIRE cross-validation procedure that many times with `labels`
+#'   randomly shuffled each time, building an empirical null distribution
+#'   of AUC for your exact sample size, feature set, and CV settings --
+#'   the correct way to judge whether the observed AUC is unusual, given
+#'   the bias described above. 200 is a reasonable default to request for
+#'   a real analysis; runtime scales linearly with this.
+#' @return list(predictions, labels, auc, sensitivity, specificity,
+#'   confusion (named TP/TN/FP/FN), cv_method, n_patients,
+#'   n_excluded_folds, null_aucs, perm_p_value). `n_excluded_folds` counts
+#'   folds where the training split had only one class present (degenerate
+#'   for logistic regression); those held-out patients get a fallback
+#'   prediction equal to the training-fold positive rate rather than a
+#'   model-based one, and are flagged rather than silently included as if
+#'   they were fully modelled. `null_aucs`/`perm_p_value` are `NULL`/`NA`
+#'   unless `n_permutations > 0`; `perm_p_value` is the (1 + #null >=
+#'   observed) / (1 + n_permutations) one-sided empirical p-value.
+#' @export
+fit_patient_classifier <- function(patient_features, labels,
+                                   cv_method = c("loo", "kfold"),
+                                   k = 5, threshold = 0.5, fixseed = 1234L,
+                                   n_permutations = 0L){
+  cv_method <- match.arg(cv_method)
+  patient_features <- as.data.frame(patient_features)
+  n <- nrow(patient_features)
+  if (length(labels) != n) {
+    stop("fit_patient_classifier: length(labels) must equal nrow(patient_features).")
+  }
+  if (n < 4) {
+    stop("fit_patient_classifier: need at least 4 patients for any form of cross-validation; got ", n, ".")
+  }
+  if (!is.numeric(n_permutations) || n_permutations < 0) {
+    stop("fit_patient_classifier: n_permutations must be a non-negative integer.")
+  }
+  ## Coerce labels to 0/1 with a clear, reproducible rule: logical as-is;
+  ## numeric must already be 0/1; factor/character uses the alphabetically
+  ## LATER of the two levels as positive (documented, not left implicit).
+  if (is.logical(labels)) {
+    y <- as.integer(labels)
+  } else if (is.numeric(labels)) {
+    if (!all(labels %in% c(0, 1))) stop("fit_patient_classifier: numeric labels must be 0/1.")
+    y <- as.integer(labels)
+  } else {
+    lv <- sort(unique(as.character(labels)))
+    if (length(lv) != 2) stop("fit_patient_classifier: labels must have exactly two distinct values; found ",
+                              length(lv), ": ", paste(lv, collapse = ", "))
+    y <- as.integer(as.character(labels) == lv[2])
+    message("fit_patient_classifier: treating '", lv[2], "' as the positive class (vs. '", lv[1], "').")
+  }
+  if (length(unique(y)) != 2) stop("fit_patient_classifier: labels must have exactly two classes present.")
+  if (ncol(patient_features) == 0) stop("fit_patient_classifier: patient_features has no predictor columns.")
+  if (identical(cv_method, "kfold") && (k < 2 || k > n)) {
+    stop("fit_patient_classifier: k must be between 2 and n_patients.")
+  }
+
+  ## Runs the full CV procedure once for a given label vector, returning
+  ## out-of-fold predictions. Used for both the real labels and (if
+  ## n_permutations > 0) each permutation -- kept as one function so the
+  ## real analysis and its null calibration can never silently diverge in
+  ## how they're computed.
+  .run_cv_once <- function(y_vec, seed_offset){
+    fold_id <- if (identical(cv_method, "loo")) {
+      seq_len(n)
+    } else {
+      set.seed(fixseed + seed_offset)
+      sample(rep(seq_len(k), length.out = n))
+    }
+    pred <- rep(NA_real_, n)
+    n_excl <- 0L
+    for (fold in unique(fold_id)) {
+      test_idx  <- which(fold_id == fold)
+      train_idx <- setdiff(seq_len(n), test_idx)
+      y_train <- y_vec[train_idx]
+
+      if (length(unique(y_train)) < 2) {
+        pred[test_idx] <- mean(y_train)
+        n_excl <- n_excl + length(test_idx)
+        next
+      }
+      train_df <- patient_features[train_idx, , drop = FALSE]
+      train_df$.y <- y_train
+      fit <- tryCatch(
+        suppressWarnings(stats::glm(.y ~ ., data = train_df, family = stats::binomial())),
+        error = function(e) NULL
+      )
+      if (is.null(fit)) {
+        pred[test_idx] <- mean(y_train)
+        n_excl <- n_excl + length(test_idx)
+        next
+      }
+      pred[test_idx] <- suppressWarnings(
+        stats::predict(fit, newdata = patient_features[test_idx, , drop = FALSE], type = "response")
+      )
+    }
+    list(pred = pred, n_excluded = n_excl)
+  }
+
+  real_run <- .run_cv_once(y, seed_offset = 0L)
+  pred <- real_run$pred
+  n_excluded_folds <- real_run$n_excluded
+
+  auc <- .compute_auc(pred, y)
+  pred_class <- as.integer(pred >= threshold)
+  TP <- sum(pred_class == 1 & y == 1); TN <- sum(pred_class == 0 & y == 0)
+  FP <- sum(pred_class == 1 & y == 0); FN <- sum(pred_class == 0 & y == 1)
+  sensitivity <- if ((TP + FN) > 0) TP / (TP + FN) else NA_real_
+  specificity <- if ((TN + FP) > 0) TN / (TN + FP) else NA_real_
+
+  if (n_excluded_folds > 0) {
+    warning("fit_patient_classifier: ", n_excluded_folds, "/", n, " held-out patients came from a ",
+            "fold whose training split had only one class present, and got a base-rate fallback ",
+            "prediction instead of a fitted one. Results are still returned, but with fewer patients ",
+            "genuinely cross-validated than n_patients suggests -- consider k-fold with a smaller k ",
+            "if this happens often with 'loo'.", call. = FALSE)
+  }
+
+  null_aucs <- NULL
+  perm_p_value <- NA_real_
+  if (n_permutations > 0) {
+    set.seed(fixseed)
+    perm_labels <- replicate(n_permutations, sample(y), simplify = FALSE)
+    null_aucs <- vapply(seq_len(n_permutations), function(i) {
+      run <- .run_cv_once(perm_labels[[i]], seed_offset = i)
+      .compute_auc(run$pred, perm_labels[[i]])
+    }, numeric(1))
+    valid_null <- null_aucs[!is.na(null_aucs)]
+    perm_p_value <- (1 + sum(valid_null >= auc)) / (1 + length(valid_null))
+  }
+
+  list(predictions = pred, labels = y, auc = auc,
+      sensitivity = sensitivity, specificity = specificity,
+      confusion = c(TP = TP, TN = TN, FP = FP, FN = FN),
+      cv_method = cv_method, n_patients = n, n_excluded_folds = n_excluded_folds,
+      null_aucs = null_aucs, perm_p_value = perm_p_value)
+}
+
+
+#' Tag markers as "broad" (gating/lineage) or "specific"
+#'
+#' One-vs-rest differential-abundance tests are structurally disadvantaged
+#' for markers that are canonical for MULTIPLE cell types (gating/lineage
+#' markers), since the "rest" comparison group is itself partly composed of
+#' true-positive cells -- exactly the case scProtXpress's compositional
+#' scoring is designed to handle well. This function classifies each marker
+#' in a long-format marker-to-cell-type canonical mapping (e.g. from
+#' CellMarker DB) as "broad" (canonical for more than one of the profiled
+#' cell types) or "specific" (canonical for exactly one), so recall/
+#' precision can be reported separately per tier instead of pooled into one
+#' number that conflates two different questions.
+#'
+#' @param marker_celltype_map A long-format data.frame/matrix: one row per
+#'   (marker, cell type) canonical pairing, e.g. `data.frame(marker =
+#'   c("CD3","CD3","CD19"), cell.type = c("Tcell","NKT","Bcell"))`.
+#' @param marker_col,celltype_col Column names (default "marker",
+#'   "cell.type").
+#' @return data.frame: `marker`, `n_celltypes` (how many distinct cell
+#'   types this marker is canonical for in the input), `tier` ("broad" if
+#'   `n_celltypes > 1`, else "specific").
+#' @export
+tag_marker_specificity <- function(marker_celltype_map, marker_col = "marker", celltype_col = "cell.type"){
+  if (!all(c(marker_col, celltype_col) %in% colnames(marker_celltype_map))) {
+    stop("tag_marker_specificity: marker_celltype_map must have columns '",
+         marker_col, "' and '", celltype_col, "'.")
+  }
+  df <- unique(marker_celltype_map[, c(marker_col, celltype_col)])
+  counts <- table(df[[marker_col]])
+  out <- data.frame(marker = names(counts), n_celltypes = as.integer(counts),
+                    stringsAsFactors = FALSE)
+  out$tier <- ifelse(out$n_celltypes > 1, "broad", "specific")
+  out[order(out$marker), ]
+}
+
+#' Precision/recall/F1/FPR for a set of predicted calls against ground
+#' truth, optionally stratified by a grouping column
+#'
+#' Generic evaluator: takes any table of (marker, cell.type, expr.level)
+#' predictions -- e.g. the row-bound `sig_tbl.txt` outputs from a full
+#' `run_scProteinXpress()` scan, each tagged with which population it came
+#' from -- and a ground-truth set of (marker, cell.type) pairs considered a
+#' true positive, and computes the standard classification metrics. Pass
+#' `group_col = "tier"` with a column joined in from
+#' `tag_marker_specificity()` to compare precision/recall between "broad"
+#' and "specific" markers in one call.
+#'
+#' @param calls data.frame with (at least) `marker`, `cell.type`,
+#'   `expr.level` columns.
+#' @param ground_truth data.frame with (at least) `marker`, `cell.type`
+#'   columns -- pairs where the marker is canonically expected in that cell
+#'   type (a true positive).
+#' @param positive_levels Character vector of `expr.level` values counted
+#'   as a positive call. Default `c("medium", "high")`.
+#' @param group_col Optional column name in `calls` to stratify by (e.g.
+#'   `"tier"`). When given, one row per group value is returned plus one
+#'   `"overall"` row; when `NULL` (default), only the `"overall"` row.
+#' @param restrict_to_ground_truth_markers logical, default `TRUE`.
+#'   Restricts evaluation to (marker, cell.type) pairs where the MARKER
+#'   appears somewhere in `ground_truth` (for any cell type) -- otherwise
+#'   every marker scProtXpress called that was simply never assessed for
+#'   ground truth (because no compendium is exhaustive) would count as a
+#'   false positive purely for not being in an incomplete reference list.
+#'   Set `FALSE` only if your `ground_truth` genuinely covers every marker
+#'   in `calls`.
+#' @return data.frame: `group` ("overall" plus one row per `group_col`
+#'   value if given), `n_pairs_evaluated`, `TP`, `FP`, `FN`, `TN`,
+#'   `precision`, `recall`, `f1`, `fpr`.
+#' @export
+evaluate_calls <- function(calls, ground_truth,
+                           positive_levels = c("medium", "high"),
+                           group_col = NULL,
+                           restrict_to_ground_truth_markers = TRUE){
+  req_cols <- c("marker", "cell.type", "expr.level")
+  if (!all(req_cols %in% colnames(calls))) {
+    stop("evaluate_calls: `calls` must have columns: ", paste(req_cols, collapse = ", "))
+  }
+  if (!all(c("marker", "cell.type") %in% colnames(ground_truth))) {
+    stop("evaluate_calls: `ground_truth` must have columns 'marker' and 'cell.type'.")
+  }
+  if (!is.null(group_col) && !group_col %in% colnames(calls)) {
+    stop("evaluate_calls: group_col = '", group_col, "' not found in `calls`.")
+  }
+
+  calls <- calls
+  if (isTRUE(restrict_to_ground_truth_markers)) {
+    calls <- calls[calls$marker %in% unique(ground_truth$marker), , drop = FALSE]
+  }
+  if (nrow(calls) == 0) {
+    stop("evaluate_calls: no rows of `calls` remain after restricting to markers present ",
+         "in `ground_truth` -- check that marker names match between the two tables ",
+         "(case/whitespace differences are a common cause).")
+  }
+
+  gt_pairs <- paste(ground_truth$marker, ground_truth$cell.type, sep = "\u0001")
+  calls$is_positive_call <- calls$expr.level %in% positive_levels
+  calls$is_true_positive_pair <- paste(calls$marker, calls$cell.type, sep = "\u0001") %in% gt_pairs
+
+  .metrics_for <- function(df, label) {
+    TP <- sum(df$is_positive_call & df$is_true_positive_pair)
+    FP <- sum(df$is_positive_call & !df$is_true_positive_pair)
+    FN <- sum(!df$is_positive_call & df$is_true_positive_pair)
+    TN <- sum(!df$is_positive_call & !df$is_true_positive_pair)
+    precision <- if ((TP + FP) > 0) TP / (TP + FP) else NA_real_
+    recall    <- if ((TP + FN) > 0) TP / (TP + FN) else NA_real_
+    f1        <- if (!is.na(precision) && !is.na(recall) && (precision + recall) > 0) {
+      2 * precision * recall / (precision + recall)
+    } else NA_real_
+    fpr <- if ((FP + TN) > 0) FP / (FP + TN) else NA_real_
+    data.frame(group = label, n_pairs_evaluated = nrow(df),
+              TP = TP, FP = FP, FN = FN, TN = TN,
+              precision = precision, recall = recall, f1 = f1, fpr = fpr,
+              stringsAsFactors = FALSE)
+  }
+
+  out <- .metrics_for(calls, "overall")
+  if (!is.null(group_col)) {
+    per_group <- do.call(rbind, lapply(sort(unique(calls[[group_col]])), function(g) {
+      .metrics_for(calls[calls[[group_col]] == g, , drop = FALSE], g)
+    }))
+    out <- rbind(per_group, out)
+  }
+  rownames(out) <- NULL
+  out
+}
+
+
+#'
+#' Answers "how much reference is enough?" directly: rebuilds thresholds
+#' at a series of subsample fractions of the reference (either by CELLS,
+#' preserving whichever datasets/cell types happen to be present, or by
+#' whole DATASETS, which also tests sensitivity to how many independent
+#' studies contribute), repeated `n_replicates` times per fraction to
+#' separate sampling noise from a genuine trend, and reports each
+#' fraction's threshold estimate against the full reference's.
+#'
+#' @param data_norm proteins x cells matrix, ADTnorm-normalized.
+#' @param metadata data.frame aligned POSITIONALLY to `data_norm`'s
+#'   columns; needs a `dataset` column only when `subsample_by =
+#'   "datasets"`.
+#' @param fractions Numeric vector in (0, 1], default
+#'   `c(0.1, 0.25, 0.5, 0.75, 1.0)`. `1.0` is always treated as the full
+#'   reference (ground truth to compare every other fraction against) even
+#'   if you omit it -- it's added back automatically if missing.
+#' @param subsample_by "cells" (default; randomly drop individual cells,
+#'   keeping whichever datasets/cell types are already present) or
+#'   "datasets" (randomly drop whole datasets -- requires a `dataset`
+#'   column in `metadata`, and tests a different question: does the
+#'   reference need many independent studies, not just many cells).
+#' @param n_replicates Integer, default 3. Independent random subsamples
+#'   per fraction (other than 1.0, which has only one "replicate": the
+#'   full data).
+#' @param markers Optional character vector to restrict to.
+#' @param sample_n,num.boot.sample,bootstrap_stratify,threshold_method,ncores,fixseed
+#'   Forwarded to every `GetBackground()` call -- keep identical to your
+#'   real reference build for an apples-to-apples comparison.
+#' @return A data.frame, one row per (marker, fraction, replicate): `marker`,
+#'   `fraction`, `replicate`, `n_cells_used`, `Lower`, `Upper`,
+#'   `abs_shift_lower`/`abs_shift_upper` (vs. the fraction-1.0 threshold for
+#'   that marker). Aggregate with e.g.
+#'   `aggregate(abs_shift_upper ~ marker + fraction, data = result, FUN = mean)`
+#'   to get a convergence curve per marker, or average across markers for
+#'   an overall curve.
+#' @export
+downsample_reference_stability <- function(
+    data_norm, metadata,
+    fractions = c(0.1, 0.25, 0.5, 0.75, 1.0),
+    subsample_by = c("cells", "datasets"),
+    n_replicates = 3,
+    markers = NULL,
+    sample_n = 100, num.boot.sample = 200,
+    bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
+    threshold_method = c("rectangle", "mixture", "quantile", "zscore"),
+    ncores = 1L, fixseed = 1234L
+){
+  subsample_by       <- match.arg(subsample_by)
+  bootstrap_stratify <- match.arg(bootstrap_stratify)
+  threshold_method   <- match.arg(threshold_method)
+
+  data_norm <- .as_dense_matrix(data_norm)
+  if (ncol(data_norm) != nrow(metadata)) {
+    stop("downsample_reference_stability: ncol(data_norm) must equal nrow(metadata) ",
+         "(rows of metadata are matched POSITIONALLY to columns of data_norm).")
+  }
+  if (any(fractions <= 0 | fractions > 1)) {
+    stop("downsample_reference_stability: fractions must all be in (0, 1].")
+  }
+  if (identical(subsample_by, "datasets") && !"dataset" %in% colnames(metadata)) {
+    stop("downsample_reference_stability: subsample_by = 'datasets' requires a ",
+         "'dataset' column in metadata.")
+  }
+  if (!1.0 %in% fractions) fractions <- c(fractions, 1.0)
+  fractions <- sort(unique(fractions))
+
+  eligible_markers <- if (is.null(markers)) rownames(data_norm) else intersect(markers, rownames(data_norm))
+  data_sub <- data_norm[eligible_markers, , drop = FALSE]
+
+  set.seed(fixseed)
+  n_cells <- ncol(data_sub)
+  dataset_vec <- if ("dataset" %in% colnames(metadata)) as.character(metadata$dataset) else NULL
+
+  .subsample_idx <- function(frac) {
+    if (frac >= 1.0) return(seq_len(n_cells))
+    if (identical(subsample_by, "cells")) {
+      sort(sample(seq_len(n_cells), size = max(1, round(n_cells * frac))))
+    } else {
+      ds <- unique(dataset_vec)
+      keep_ds <- sample(ds, size = max(1, round(length(ds) * frac)))
+      which(dataset_vec %in% keep_ds)
+    }
+  }
+
+  ## Each (fraction, replicate) gets its OWN explicit seed for subsample
+  ## selection, rather than relying on the ambient RNG state. This matters
+  ## because GetBackground()/RunBootstrap() calls set.seed(fixseed)
+  ## internally on every call (so that a single GetBackground() call is
+  ## independently reproducible) -- which has the side effect that the RNG
+  ## state immediately AFTER any .run_gb() call is fully determined by
+  ## fixseed and the call's data size, not by what happened before it. Left
+  ## unaddressed, this would silently collapse different "replicates" of
+  ## the same fraction into duplicates of each other.
+  ## sample.int(.Machine$integer.max, 1) after seeding on a per-cell
+  ## deterministic combination of (fraction, replicate) gives a distinct,
+  ## reproducible seed for every combination without depending on call order.
+  .cell_seed <- function(frac, rep_i, tag) {
+    set.seed(fixseed)  # start from a known state so the derived seed is reproducible
+    key <- as.integer(round(frac * 1e4)) * 100003L + as.integer(rep_i) * 7L + (if (identical(tag, "subsample")) 1L else 2L)
+    set.seed(key)
+    sample.int(.Machine$integer.max, 1)
+  }
+
+  .run_gb <- function(idx, label, seed_for_gb) {
+    GetBackground(data_sub[, idx, drop = FALSE], tempfile(paste0("downsample_", label, "_")),
+                  label, metadata[idx, , drop = FALSE],
+                  sample_n = sample_n, parallelize = (ncores > 1), ncores = ncores,
+                  num.boot.sample = num.boot.sample, fixseed = seed_for_gb,
+                  bootstrap_stratify = bootstrap_stratify, threshold_method = threshold_method)
+  }
+
+  full_th <- .run_gb(seq_len(n_cells), "full", fixseed)
+
+  rows <- list()
+  for (frac in fractions) {
+    n_rep_this_frac <- if (frac >= 1.0) 1L else n_replicates
+    for (rep_i in seq_len(n_rep_this_frac)) {
+      if (frac >= 1.0) {
+        idx <- seq_len(n_cells)
+        th  <- full_th
+      } else {
+        set.seed(.cell_seed(frac, rep_i, "subsample"))
+        idx <- .subsample_idx(frac)
+        th  <- .run_gb(idx, paste0("f", round(frac * 100), "_r", rep_i),
+                       .cell_seed(frac, rep_i, "bootstrap"))
+      }
+      n_used <- length(idx)
+      for (m in eligible_markers) {
+        if (is.null(th[[m]])) next
+        lo <- mean(th[[m]][, "Lower"]); hi <- mean(th[[m]][, "Upper"])
+        full_lo <- mean(full_th[[m]][, "Lower"]); full_hi <- mean(full_th[[m]][, "Upper"])
+        rows[[length(rows) + 1]] <- data.frame(
+          marker = m, fraction = frac, replicate = rep_i, n_cells_used = n_used,
+          Lower = lo, Upper = hi,
+          abs_shift_lower = abs(lo - full_lo), abs_shift_upper = abs(hi - full_hi),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  do.call(rbind, rows)
+}
+
+#' Per-population sig-table computation, dispatching to the pooled-cell test
+#' or a donor-aware one
+#'
+#' Used by `run_scProteinXpress()`'s `sig.frames` block. Kept as a
+#' top-level function (not nested inside `run_scProteinXpress()`) so this
+#' dispatch logic -- pooled vs. donor-aware, and the fallback when donor
+#' metadata isn't available -- can be unit-tested directly
+#' (`tests/testthat/test-sig-test-dispatch.R`) without needing a full
+#' pipeline run.
+#'
+#' @param discretised_data proteins x cells discretised matrix for one
+#'   population.
+#' @param pop_meta data.frame with (at least) `cell.id` and `sample`
+#'   columns for the same population, or `NULL` if unavailable (e.g. a
+#'   `Query_<pop>` directory built before donor metadata was persisted
+#'   alongside it).
+#' @param min.coverage.fraction.sigframe,audit_path As in
+#'   `Create.sig.frame()`.
+#' @param sig_test_method "pooled" (default; original behaviour, byte-for-
+#'   byte identical output) or one of `discrete.expr.levels_donor()`'s
+#'   `test_method` options ("donor_t", "donor_wilcox", "design_effect").
+#'   Falls back to "pooled" with a warning if `pop_meta` is `NULL` or has
+#'   no `sample` column, rather than silently doing nothing.
+#' @param min_donors_for_call As in `discrete.expr.levels_donor()`.
+#' @return A sig-table data.frame (same shape either way: `discrete.expr.levels()`'s
+#'   or `discrete.expr.levels_donor()`'s output).
+#' @noRd
+.compute_sig_table_for_population <- function(discretised_data, pop_meta,
+                                              min.coverage.fraction.sigframe,
+                                              audit_path,
+                                              sig_test_method = "pooled",
+                                              min_donors_for_call = 2L){
+  ## Prefer the canonical 'donor' column (present whenever pop_meta was
+  ## persisted by a version of run_scProteinXpress() that resolves
+  ## donor_col). Fall back to 'sample' for Query_<pop>/*_Metadata.rds files
+  ## written before donor_col existed, where donor == sample was implicit
+  ## rather than explicit -- same effective behaviour, just not
+  ## configurable for those older files without regenerating them.
+  donor_col_present <- !is.null(pop_meta) && "cell.id" %in% colnames(pop_meta) &&
+    ("donor" %in% colnames(pop_meta) || "sample" %in% colnames(pop_meta))
+  donor_col_name <- if (!is.null(pop_meta) && "donor" %in% colnames(pop_meta)) "donor" else "sample"
+
+  if (identical(sig_test_method, "pooled") || !donor_col_present) {
+    if (!identical(sig_test_method, "pooled")) {
+      warning("sig_test_method = '", sig_test_method, "' requested but no per-cell ",
+              "donor/sample metadata is available for this population (a Query_<pop> ",
+              "directory built before donor-aware metadata was persisted, or metadata ",
+              "with no 'donor'/'sample' column) -- falling back to the pooled-cell test ",
+              "for THIS population only. This test treats every cell as an independent ",
+              "trial and is anti-conservative whenever cells are correlated within donor; ",
+              "treat any resulting call for this population with that in mind.",
+              call. = FALSE)
+    }
+    sig.res <- Create.sig.frame(discretised_data,
+                                min.coverage.fraction.sigframe = min.coverage.fraction.sigframe,
+                                audit_csv_path = audit_path)
+    return(discrete.expr.levels(sig.res[[1]], sig.res[[2]],
+                                prob_low = sig.res[[3]], prob_high = sig.res[[4]]))
+  }
+
+  ## Donor-aware path. Note: this still derives prob_low/prob_high from the
+  ## SAME pooled population (Create.sig.frame()'s self-referential
+  ## baseline) -- the donor fix addresses pseudoreplication in the TEST
+  ## across cells vs. donors; it does not by itself fix the separate
+  ## self-referential-baseline issue (see ComputeExternalBaseline() for
+  ## that, which composes with either test).
+  sig.res <- Create.sig.frame(discretised_data,
+                              min.coverage.fraction.sigframe = min.coverage.fraction.sigframe,
+                              audit_csv_path = audit_path)
+  donor_ids <- pop_meta[[donor_col_name]][match(colnames(discretised_data), pop_meta$cell.id)]
+  if (anyNA(donor_ids)) {
+    warning(".compute_sig_table_for_population: could not align donor IDs (column '",
+            donor_col_name, "') to every discretised cell for this population (",
+            sum(is.na(donor_ids)), "/", length(donor_ids), " unmatched) -- falling ",
+            "back to the pooled-cell test for this population.", call. = FALSE)
+    return(discrete.expr.levels(sig.res[[1]], sig.res[[2]],
+                                prob_low = sig.res[[3]], prob_high = sig.res[[4]]))
+  }
+  by_donor <- Create.sig.frame_by_donor(discretised_data, donor_ids)
+  discrete.expr.levels_donor(by_donor, sig.res[[3]], sig.res[[4]],
+                             test_method = sig_test_method,
+                             min_donors_for_call = min_donors_for_call)
 }

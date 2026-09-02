@@ -18,7 +18,7 @@
 #'         100L for CITE-seq, matching the historical defaults.
 #' }
 #'
-#' @section Metadata column resolution (A1):
+#' @section Metadata column resolution:
 #' Each `*_col` argument is resolved against `metadata` by trying the
 #' explicit value first then a list of fallbacks:
 #' \describe{
@@ -27,13 +27,15 @@
 #'         "cell.type_harmonised".}
 #'   \item{dataset_col}{user, "dataset_id", "dataset".}
 #'   \item{sample_col}{user, "sample_id", "sample".}
+#'   \item{donor_col}{user, "donor_id", "donor", "patient_id", "patient",
+#'         falls back to whatever `sample_col` resolved to.}
 #'   \item{batch_col}{user, "batch_id", "batch", falls back to `sample`.}
 #'   \item{tissue_col}{user, "tissue", "tissue_id", falls back to
 #'         `tissue_default`.}
 #' }
 #' The first column found is renamed in place to the internal canonical
 #' name used by everything downstream (`cell.id`, `cell.type`, `dataset`,
-#' `sample`, `batch`, `tissue`).
+#' `sample`, `donor`, `batch`, `tissue`).
 #'
 #' @section Input transformation state:
 #' `is_transformed = NULL` (default) delegates detection to
@@ -63,6 +65,17 @@
 #'   resolves auto-defaults for `qc_outlier_cells` and `num.cells.sample`.
 #' @param cell_id_col,cell_type_col,dataset_col,sample_col,batch_col,tissue_col
 #'   Column names in `metadata` (see Metadata column resolution).
+#' @param donor_col Column in `metadata` identifying the donor/patient, for
+#'   `sig_test_method`'s donor-aware tests. If `NULL` (default), falls back
+#'   to whatever `sample_col` resolved to -- fine when one sample IS one
+#'   donor, which is the common case. Set this explicitly when it isn't:
+#'   longitudinal data (same donor, several timepoints, each its own
+#'   `sample`), multi-tissue-per-donor data, or multiplexed/hashed runs
+#'   where `sample` is a technical/run label and true donor identity comes
+#'   from a separate demultiplexing column. Getting this wrong doesn't
+#'   error -- it silently treats the wrong grouping as "donor", which for
+#'   the longitudinal case in particular reintroduces a pseudoreplication
+#'   problem one level up from the one `sig_test_method` exists to fix.
 #' @param is_transformed NULL, TRUE, FALSE. See Input transformation state.
 #' @param sqs_threshold Numeric. SQS cutoff when `apply_sqs != "none"`.
 #' @param apply_sqs "none" (default), "ref_only", "both".
@@ -86,11 +99,47 @@
 #'     \item `"cell.type"` stratifies the bootstrap by cell type. Each cell
 #'       type contributes an equal share of `num.cells.sample` cells per
 #'       iteration. Advanced option.
-#'     \item `"cell.type_tissue"` stratifies by `cell.type` x `tissue` and
-#'       reproduces the behaviour shipped in Hito 2 T-3, kept for
-#'       back-compatibility with the CyTOF reference run. Falls back to
+#'     \item `"cell.type_tissue"` stratifies by `cell.type` x `tissue`, kept
+#'       for back-compatibility with the CyTOF reference run. Falls back to
 #'       `"cell.type"` (with a warning) when no `tissue` column is present.
 #'   }
+#' @param threshold_method one of "rectangle" (default; original
+#'   scGeneXpress-derived heuristic, bit-for-bit unchanged from prior
+#'   releases), "mixture" (fits a 1-3 component Gaussian mixture per
+#'   bootstrap draw via `mclust` and uses the Bayes decision boundary
+#'   between fitted components as the low/high cut; requires `mclust`,
+#'   falls back to "rectangle" per-marker if the fit is unstable or a
+#'   single component is selected; see `createThresholdDist_mixture()`),
+#'   "quantile" (10th/90th percentile of the pooled reference values; see
+#'   `createThresholdDist_quantile()`), or "zscore" (mean +/- 1 SD, clamped
+#'   to the observed range; see `createThresholdDist_zscore()`). The last
+#'   two are simple reference-informed baselines with none of the
+#'   bootstrap/discretisation machinery the first two use -- rerun the same
+#'   pipeline with each `threshold_method` on identical data to see whether
+#'   an accuracy advantage comes from the reference itself or from the
+#'   specific thresholding procedure.
+#' @param sig_test_method Population-level significance test used by the
+#'   `sig.frames` step. NOT the same thing as
+#'   `bootstrap_stratify` above -- that stratifies the REFERENCE bootstrap
+#'   by cell type/tissue when estimating per-protein thresholds;
+#'   `sig_test_method` controls how a disease-vs-healthy (or any query)
+#'   population's protein calls are tested, and defaults to "pooled" (the
+#'   original behaviour: every CELL in the population is treated as an
+#'   independent trial in a single `pbinom` test, which is anti-conservative
+#'   whenever cells are correlated within donor -- confirmed by simulation
+#'   to inflate false-positive rates 4-8x at realistic between-donor ICC;
+#'   see `tests/testthat/test-calibration.R`). Set to `"donor_t"`,
+#'   `"donor_wilcox"`, or `"design_effect"` to test across donors instead
+#'   -- see `discrete.expr.levels_donor()` for what each does. Uses the
+#'   `donor` identifier resolved by `donor_col` below (which defaults to
+#'   whatever `sample_col` resolved to if you don't set it separately);
+#'   silently has no effect (falls back to "pooled", with a warning naming
+#'   the population) for any population where that isn't available, e.g. a
+#'   `Query_<pop>` directory built before this option existed.
+#' @param min_donors_for_call Integer, default 2. Populations with fewer
+#'   contributing donors than this are forced to `"not.significant"`
+#'   rather than a confident call. Only used when `sig_test_method !=
+#'   "pooled"`.
 #' @param ... Forwarded to internal normalisation helpers.
 #' @return `invisible(NULL)`. Side effects: files under `dir/Ref_<file.name>/`.
 #' @export
@@ -110,39 +159,59 @@ run_scProteinXpress <- function(
     tissue_default = "PBMC",
     ## ---- modality dispatch ----
     modality = c("CyTOF", "CITE-seq"),
-    ## ---- metadata column mapping (A1 fallbacks applied internally) ----
+    ## ---- metadata column mapping (fallbacks applied internally) ----
     cell_id_col   = "cell_id",
     cell_type_col = "cell_type",
     dataset_col   = "dataset_id",
     sample_col    = "sample_id",
     batch_col     = "batch",
     tissue_col    = "tissue",
+    ## ---- donor/patient identifier for sig_test_method donor-aware tests --
+    ## Defaults to whatever sample_col resolves to (donor == sample is the
+    ## common case) -- set this explicitly whenever that's NOT true for
+    ## your data: longitudinal designs (same donor, multiple timepoints,
+    ## each its own "sample"), multi-tissue-per-donor designs, or
+    ## multiplexed/hashed runs where "sample" is a technical/batch label
+    ## and true donor identity comes from a separate demultiplexing column.
+    ## Getting this wrong silently defeats the point of the donor-aware
+    ## tests -- treating repeated timepoints from the same donor as if they
+    ## were independent donors reintroduces the pseudoreplication problem
+    ## sig_test_method exists to fix, just one level up.
+    donor_col     = NULL,
     ## ---- input transformation state ----
     is_transformed = NULL,          # NULL => autodetect by .detect_input_mode().
     ## ---- SQS (off by default) ----
     sqs_threshold = 1.0,
     apply_sqs = c("none", "ref_only", "both"),
-    ## ---- P2: COVERAGE FILTERS (Mode C: single global filter after union) ----
+    ## ---- Coverage filters (single global filter after union) ----
     min.cells.feature     = 10,     # absolute: at least N cells with non-zero, non-NA value
     min.coverage.fraction = 0.10,   # fraction:  at least 10% of cells have a non-NA measurement
-    ## ---- P3: SIG_FRAME PER-POPULATION COVERAGE FILTER (binomial baseline) ----
+    ## ---- Per-population coverage filter (binomial baseline) ----
     min.coverage.fraction.sigframe = 0.10,
-    ## ---- QC: cell-level outlier filter (scuttle, opt-in unified) ----
+    ## ---- QC: cell-level outlier filter (scuttle, opt-in) ----
     qc_outlier_cells = c("auto", "yes", "no"),
     qc_nmads = 3,
     ## ---- Hierarchical subsampling of the reference background ----
     do_subsample = TRUE,
     target_ct    = 2000L,
-    ## ---- Bootstrap stratification (T-7 revert; default = scGeneXpress) ----
+    ## ---- Bootstrap stratification (default = scGeneXpress behaviour) ----
     bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
+    ## ---- Threshold estimator (rectangle = original; mixture = new) -------
+    threshold_method = c("rectangle", "mixture", "quantile", "zscore"),
+    ## ---- Population-level test for sig.frames (pooled = original; the
+    ## other three test across donors) ------------------------------------
+    sig_test_method = c("pooled", "donor_t", "donor_wilcox", "design_effect"),
+    min_donors_for_call = 2L,
     ...){
 
-  modality           <- match.arg(modality)
-  apply_sqs          <- match.arg(apply_sqs)
-  qc_outlier_cells   <- match.arg(qc_outlier_cells)
-  bootstrap_stratify <- match.arg(bootstrap_stratify)
+  modality             <- match.arg(modality)
+  apply_sqs            <- match.arg(apply_sqs)
+  qc_outlier_cells     <- match.arg(qc_outlier_cells)
+  bootstrap_stratify   <- match.arg(bootstrap_stratify)
+  threshold_method     <- match.arg(threshold_method)
+  sig_test_method      <- match.arg(sig_test_method)
 
-  ## Resolve modality-dependent default for num.cells.sample (A4).
+  ## Resolve modality-dependent default for num.cells.sample.
   if (is.null(num.cells.sample)) {
     num.cells.sample <- if (identical(modality, "CyTOF")) 1000L else 100L
   }
@@ -156,7 +225,7 @@ run_scProteinXpress <- function(
   ## Resolve `qc_outlier_cells = "auto"` to a concrete "yes" / "no". This is
   ## the single source of truth for the scuttle outlier filter activation;
   ## downstream code (cleanData_ADT, PrepQueryData_ADT) only ever sees the
-  ## resolved value (Hito 3, Task #14 follow-up to Hito 2 D2).
+  ## resolved value.
   qc_outlier_cells_resolved <- if (identical(qc_outlier_cells, "auto")) {
     if (identical(modality, "CITE-seq")) "yes" else "no"
   } else {
@@ -169,9 +238,9 @@ run_scProteinXpress <- function(
   use_precBack <- is.character(precBack) && length(precBack) == 1 && nzchar(precBack) && dir.exists(precBack)
 
   ## -------------------------------------------------------------------------
-  ## Entry-point validations (V1-V3, V14-V25). Cell-level validations that
-  ## need post-translation metadata (V4-V13, V28) happen after the metadata
-  ## translation block below.
+  ## Entry-point validations. Cell-level validations that need
+  ## post-translation metadata happen after the metadata translation block
+  ## below.
   ## -------------------------------------------------------------------------
   if (!(is.matrix(data) || inherits(data, "Matrix") || is.data.frame(data))) {
     stop("data must be matrix, Matrix, or data.frame; got ", paste(class(data), collapse = ","))
@@ -226,7 +295,7 @@ run_scProteinXpress <- function(
   metadata <- ingest$metadata
 
   ## -------------------------------------------------------------------------
-  ## Metadata translation with A1 fallbacks: each *_col is resolved against
+  ## Metadata translation with fallbacks: each *_col is resolved against
   ## metadata trying the user value first then a list of fallbacks. The
   ## first match wins and is renamed in place to the canonical internal
   ## name. Internal canonical names are: cell.id, cell.type, dataset,
@@ -244,6 +313,15 @@ run_scProteinXpress <- function(
   metadata <- .resolve_meta_col(metadata, sample_col,
                                 fallbacks = c("sample_id", "sample"),
                                 internal_name = "sample")
+  ## `donor` defaults to whatever `sample` resolved to above when the
+  ## caller doesn't specify donor_col -- this is what makes donor == sample
+  ## the zero-config default while still letting callers whose donor
+  ## concept differs from their sample concept say so explicitly.
+  metadata <- .resolve_meta_col(metadata,
+                                primary = donor_col,
+                                fallbacks = c("donor_id", "donor", "patient_id", "patient"),
+                                internal_name = "donor",
+                                fallback_from = "sample")
   ## `batch` is optional in the published ADTnorm: if absent, falls back
   ## to `sample` (matches the codebase/run_scProteinXpress.R behaviour).
   ## Driver-level callers (CyTOF) always pass an explicit batch, so this
@@ -272,7 +350,7 @@ run_scProteinXpress <- function(
   rownames(metadata) <- metadata$cell.id
 
   ## -------------------------------------------------------------------------
-  ## Cell-level alignment validations (A5 strengthening of V13).
+  ## Cell-level alignment validations.
   ## -------------------------------------------------------------------------
   if (ncol(data) < 50L) stop(sprintf("data has %d cells; at least 50 are required (published cell-type threshold).", ncol(data)))
   if (any(duplicated(colnames(data)))) stop("duplicate cell ids in colnames(data)")
@@ -326,7 +404,7 @@ run_scProteinXpress <- function(
     if (!(file.exists(bg_norm_path) && file.exists(bg_pars_path))) {
       message("Building background...")
       
-      # P2 (Mode C): build a single NA-padded union matrix without per-dataset
+      # Build a single NA-padded union matrix without per-dataset
       # filtering, then apply ONE global cleanData_ADT with the configured
       # coverage thresholds. This avoids the per-dataset bias where a marker
       # measured in only one tiny panel could pass a per-dataset filter and
@@ -364,7 +442,7 @@ run_scProteinXpress <- function(
         "[Ref build] Union matrix before global filter: %d markers x %d cells (from %d datasets).",
         nrow(dataBack_union), ncol(dataBack_union), length(ds_list)))
       
-      # Single global QC pass (Mode C). Audit CSV lands in the Ref dir so it
+      # Single global QC pass. Audit CSV lands in the Ref dir so it
       # can be inspected and tied to this exact run.
       audit_csv <- file.path(ref_dir, paste0(file.name, "_excluded_markers.csv"))
       qc_global <- suppressWarnings(cleanData_ADT(
@@ -428,7 +506,7 @@ run_scProteinXpress <- function(
       bg.prot.pars <- readRDS(bg_pars_path)
       # When the Ref is cached, load the persisted sanitised counts/metadata too.
       # If they don't exist (older Ref built before this fix), fall back to
-      # rebuilding the sanitised data using the SAME Mode C logic as the main
+      # rebuilding the sanitised data using the same global-filter logic as the main
       # build path (single global filter), so self-query stays consistent.
       if (file.exists(bg_counts_path) && file.exists(bg_meta_path)) {
         dataBack     <- readRDS(bg_counts_path)
@@ -437,7 +515,7 @@ run_scProteinXpress <- function(
         warning(sprintf(
           "Cached Ref at %s has no persisted BackCounts/BackMetadata (older run). %s",
           ref_dir,
-          "Self-query will rebuild the sanitised data using Mode C global filter."
+          "Self-query will rebuild the sanitised data using the global filter."
         ))
         cells_by_ds <- split(metadataBack$cell.id, metadataBack$dataset)
         ds_list <- lapply(names(cells_by_ds), function(ds) {
@@ -487,7 +565,8 @@ run_scProteinXpress <- function(
                                  ncores             = ncores,
                                  num.boot.sample    = num.boot.sample,
                                  fixseed            = fixseed,
-                                 bootstrap_stratify = bootstrap_stratify)
+                                 bootstrap_stratify = bootstrap_stratify,
+                                 threshold_method   = threshold_method)
       message(sprintf("[TIMING] GetBackground/RunBootstrap elapsed: %.1fs",
                       (proc.time() - t_bs)[["elapsed"]]))
     } else {
@@ -587,11 +666,18 @@ run_scProteinXpress <- function(
       pop_dir <- file.path(pop_outdir, paste0("Query_", pop))
       if (!dir.exists(pop_dir)) dir.create(pop_dir, recursive = TRUE)
       saveRDS(pop.norm, file = file.path(pop_dir, paste0(pop, "_NormData.rds")))
-      
+      ## Persisted so discrete.expr.levels_donor() can be used from the
+      ## sig.frames block below WITHOUT requiring donor-aware testing and
+      ## discretization to happen in the same run_scProteinXpress() call --
+      ## e.g. if discretize=TRUE now and sig.frames=TRUE later against the
+      ## same precBack. Columns are whatever survived metadata translation
+      ## (cell.id, cell.type, sample, batch, tissue, ...); only cell.id and
+      ## sample are actually used downstream.
+      saveRDS(pop.meta, file = file.path(pop_dir, paste0(pop, "_Metadata.rds")))
+
       Discretise_data(pop.norm, if (!use_precBack) ref_dir else precBack, thrs.data, outdir = pop_outdir, file.id = pop)
     })
   }
-  
   if (sig.frames) {
     base_outdir <- if (!use_precBack) ref_dir else dir
     sig_dir <- file.path(base_outdir, "sig_frames")
@@ -605,19 +691,30 @@ run_scProteinXpress <- function(
       
       discrete.data <- readRDS(dfile)
       audit_path <- file.path(sig_audit_dir, paste0(pop, "_excluded_from_baseline.csv"))
-      sig.res <- Create.sig.frame(
-        discrete.data$discretised_data,
+
+      ## Load the per-population donor/sample metadata persisted alongside
+      ## the discretised data (see the `discretize` block above) so
+      ## sig_test_method != "pooled" can actually test across donors
+      ## instead of pooled cells. NULL (with a fallback warning inside
+      ## .compute_sig_table_for_population) if this Query_<pop> directory
+      ## predates that -- e.g. built by an older version of this function,
+      ## or via a precBack pointing at one.
+      pop_meta_path <- file.path(base_outdir, paste0("Query_", pop), paste0(pop, "_Metadata.rds"))
+      pop_meta <- if (file.exists(pop_meta_path)) readRDS(pop_meta_path) else NULL
+
+      sig.tbl <- .compute_sig_table_for_population(
+        discrete.data$discretised_data, pop_meta,
         min.coverage.fraction.sigframe = min.coverage.fraction.sigframe,
-        audit_csv_path                 = audit_path
+        audit_path           = audit_path,
+        sig_test_method      = sig_test_method,
+        min_donors_for_call  = min_donors_for_call
       )
-      # Use the per-population sanitised probs for the binomial calls.
-      sig.tbl <- discrete.expr.levels(sig.res[[1]], sig.res[[2]],
-                                      prob_low  = sig.res[[3]],
-                                      prob_high = sig.res[[4]])
       
       write.table(sig.tbl, file.path(sig_dir, paste0(pop, "_sig_tbl.txt")),
                   sep = "\t", row.names = FALSE, quote = FALSE)
     })
   }
-  return(NULL)
+  ## Returns invisible(NULL): file outputs under dir/Ref_<file.name>/ are the
+  ## actual product of a run_scProteinXpress() call, not the return value.
+  invisible(NULL)
 }

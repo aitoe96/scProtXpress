@@ -1,4 +1,4 @@
-## T-7.5 — bootstrap_stratify dispatcher tests.
+## bootstrap_stratify dispatcher tests.
 ##
 ## Exercises GetBackground() in all three modes plus the argument
 ## validation surfaced by run_scProteinXpress(). The full run_scProteinXpress

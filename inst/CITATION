@@ -1,11 +1,17 @@
 citHeader("To cite scProtXpress in publications, please use:")
 
+## NOTE: fields below still need the actual journal/volume/DOI once the
+## associated manuscript is accepted -- replace the "[CITATION: preprint
+## pending]" placeholders then.
+
 bibentry(
   bibtype  = "Article",
-  title    = "scProtXpress: discretised single-cell protein expression for CyTOF and CITE-seq",
-  author   = personList(
-    person(given = "Andoni", family = "Perez", email = "amperez@cicbiogune.es")
-    ## [CITATION: preprint pending] add coauthors when manuscript is finalised
+  title    = "Defining Compositional Biomarker Signatures by Quantifying Single-cell Protein Abundance for Disease Diagnosis",
+  author   = c(
+    person(given = "Aitor", family = "Martinez Perez"),
+    person(given = "Champi Thusangi", family = "Wannige"),
+    person(given = "Sascha", family = "Jung"),
+    person(given = "Antonio", family = "del Sol")
   ),
   journal  = "[CITATION: preprint pending]",
   year     = "[CITATION: preprint pending]",
@@ -15,8 +21,23 @@ bibentry(
   doi      = "[CITATION: preprint pending]",
   url      = "[CITATION: preprint pending]",
   textVersion = paste(
-    "Perez, A. et al. (year).",
-    "scProtXpress: discretised single-cell protein expression for CyTOF and CITE-seq.",
+    "Martinez Perez, A., Wannige, C.T., Jung, S. & del Sol, A.",
+    "Defining Compositional Biomarker Signatures by Quantifying",
+    "Single-cell Protein Abundance for Disease Diagnosis.",
     "[CITATION: preprint pending]."
   )
+)
+
+bibentry(
+  bibtype  = "Manual",
+  title    = "scProtXpress: discretised single-cell protein expression for CyTOF and CITE-seq (R package)",
+  author   = c(
+    person(given = "Aitor", family = "Martinez Perez"),
+    person(given = "Champi Thusangi", family = "Wannige"),
+    person(given = "Sascha", family = "Jung"),
+    person(given = "Antonio", family = "del Sol")
+  ),
+  year    = format(Sys.Date(), "%Y"),
+  note    = paste("R package version", meta$Version),
+  url     = "https://github.com/aitoe96/scProtXpress"
 )

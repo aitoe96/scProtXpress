@@ -1,11 +1,19 @@
 Package: scProtXpress
 Title: Single-cell Protein Expression Discretisation (CyTOF + CITE-seq)
-Version: 0.1.0
+Version: 0.2.0
 Authors@R: c(
-    person(given = "Aitor",
-           family = "Martínez Pérez",
-           role = c("aut", "cre"),
-           email = "amperez@cicbiogune.es"))
+    person(given = "Aitor", family = "Martínez Pérez",
+           role = c("aut", "cre"), email = "amperez@cicbiogune.es",
+           comment = c(ORCID = NA)),
+    person(given = "Champi Thusangi", family = "Wannige",
+           role = "aut",
+           comment = "email not yet in package metadata -- fill in before Zenodo release"),
+    person(given = "Sascha", family = "Jung",
+           role = "aut",
+           comment = "email not yet in package metadata -- fill in before Zenodo release"),
+    person(given = "Antonio", family = "del Sol",
+           role = "aut", email = "antonio.delsol@uni.lu",
+           comment = "corresponding author on the associated manuscript"))
 Description: scProtXpress quantifies single-cell protein expression at the
     cell-type level by aligning samples to per-marker landmarks (ADTnorm-style
     negative / valley / positive peaks), discretising query cells against the
@@ -46,6 +54,8 @@ Suggests:
     ggplot2,
     knitr,
     rmarkdown,
+    mclust,
+    jsonlite,
     testthat (>= 3.0.0)
 Remotes:
     github::yezhengSTAT/ADTnorm

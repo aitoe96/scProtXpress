@@ -1,4 +1,4 @@
-#' CITE-seq driver template (Hito 0 Q1 resolution)
+#' CITE-seq driver template
 #'
 #' Mirror of `cytof_driver.R` for the CITE-seq path. Reference is built
 #' from a list `{$counts, $cell_x_feature}` (the conventional CITE-seq
@@ -30,8 +30,24 @@ dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 nb                <- 1000      # bootstrap iterations
 ns                <- 100       # CITE-seq default (smaller per-pop)
 sqs_threshold_val <- 1.0
-apply_sqs_val     <- "none"
+
+## --- THESE THREE USED TO BE IMPLICIT (not passed to run_scProteinXpress at
+## all, silently resolving to the package defaults "none"/"none"/
+## "rectangle"). Made explicit here after finding that the manuscript's
+## Methods describes a cell-type-by-tissue-stratified bootstrap and an
+## SQS-filtered reference, neither of which this driver was actually
+## requesting. If you change these, the `_provenance.json` written next to
+## every reference records exactly what ran -- check it before assuming the
+## manuscript text and a given `Ref_*` output agree. ---------------------
+bootstrap_stratify_val <- Sys.getenv("SCPROTXPRESS_BOOTSTRAP_STRATIFY", "cell.type_tissue")
+apply_sqs_val          <- Sys.getenv("SCPROTXPRESS_APPLY_SQS",          "ref_only")
+threshold_method_val   <- Sys.getenv("SCPROTXPRESS_THRESHOLD_METHOD",   "mixture")
+
 ncores_val        <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "4"))
+
+message(sprintf(
+  "[CONFIG] bootstrap_stratify=%s  apply_sqs=%s (threshold=%.2f)  threshold_method=%s",
+  bootstrap_stratify_val, apply_sqs_val, sqs_threshold_val, threshold_method_val))
 
 # ----------------------------------------------------------------------------
 # 2. PHASE 1 -- REFERENCE
@@ -46,26 +62,28 @@ phase_reference <- function() {
   # in run_scProteinXpress handles this automatically.
 
   run_scProteinXpress(
-    data             = unpacked$data,
-    metadata         = meta,
-    dir              = outdir,
-    file.name        = file_name_ref,
-    modality         = "CITE-seq",
-    cell_id_col      = "cell.id",
-    cell_type_col    = "cell.type_harmonised",
-    dataset_col      = "dataset",
-    sample_col       = "sample",
-    batch_col        = "batch",
-    tissue_default   = "PBMC",
-    discretize       = TRUE,
-    sig.frames       = TRUE,
-    num.boot.sample  = nb,
-    num.cells.sample = ns,
-    ncores           = ncores_val,
-    is_transformed   = unpacked$is_transformed,
-    qc_outlier_cells = "auto",      # CITE-seq => scuttle filter active.
-    sqs_threshold    = sqs_threshold_val,
-    apply_sqs        = apply_sqs_val
+    data               = unpacked$data,
+    metadata           = meta,
+    dir                = outdir,
+    file.name          = file_name_ref,
+    modality           = "CITE-seq",
+    cell_id_col        = "cell.id",
+    cell_type_col      = "cell.type_harmonised",
+    dataset_col        = "dataset",
+    sample_col         = "sample",
+    batch_col          = "batch",
+    tissue_default     = "PBMC",
+    discretize         = TRUE,
+    sig.frames         = TRUE,
+    num.boot.sample    = nb,
+    num.cells.sample   = ns,
+    ncores             = ncores_val,
+    is_transformed     = unpacked$is_transformed,
+    qc_outlier_cells   = "auto",      # CITE-seq => scuttle filter active.
+    sqs_threshold      = sqs_threshold_val,
+    apply_sqs          = apply_sqs_val,
+    bootstrap_stratify = bootstrap_stratify_val,
+    threshold_method   = threshold_method_val
   )
   invisible(NULL)
 }

@@ -41,9 +41,26 @@ p_assay           <- "exprs"          # "exprs" => arcsinh-transformed
 nb                <- 1000             # bootstrap iterations
 ns                <- 1000             # cells per bootstrap sample (CyTOF default)
 sqs_threshold_val <- 1.0
-apply_sqs_val     <- "none"           # "ref_only", "both", "none"
 enable_sqs_report <- FALSE
+
+## --- THESE THREE USED TO BE IMPLICIT (not passed to run_scProteinXpress at
+## all, silently resolving to the package defaults "none"/"none"/
+## "rectangle"). Made explicit here after finding that the manuscript's
+## Methods describes a cell-type-by-tissue-stratified bootstrap and an
+## SQS-filtered reference, neither of which this driver was actually
+## requesting -- see the same note in `citeseq_driver.R`. If you change
+## these, the `_provenance.json` written next to every reference records
+## exactly what ran; check it before assuming the manuscript text and a
+## given `Ref_*` output agree. ---------------------------------------------
+bootstrap_stratify_val <- Sys.getenv("SCPROTXPRESS_BOOTSTRAP_STRATIFY", "cell.type_tissue")
+apply_sqs_val          <- Sys.getenv("SCPROTXPRESS_APPLY_SQS",          "ref_only")
+threshold_method_val   <- Sys.getenv("SCPROTXPRESS_THRESHOLD_METHOD",   "mixture")
+
 ncores_val        <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "4"))
+
+message(sprintf(
+  "[CONFIG] bootstrap_stratify=%s  apply_sqs=%s (threshold=%.2f)  threshold_method=%s",
+  bootstrap_stratify_val, apply_sqs_val, sqs_threshold_val, threshold_method_val))
 
 # ----------------------------------------------------------------------------
 # 2. PHASE 1 -- REFERENCE
@@ -60,25 +77,27 @@ phase_reference <- function() {
   data_mat <- unpacked$data[, keep, drop = FALSE]
 
   run_scProteinXpress(
-    data            = data_mat,
-    metadata        = meta,
-    dir             = outdir,
-    file.name       = file_name_ref,
-    modality        = "CyTOF",
-    cell_id_col     = "cell_id",
-    cell_type_col   = "cell_type",
-    dataset_col     = "dataset_id",
-    sample_col      = "sample_id",
-    batch_col       = "batch",
-    tissue_default  = "PBMC",
-    discretize      = TRUE,
-    sig.frames      = TRUE,
-    num.boot.sample = nb,
-    num.cells.sample = ns,
-    ncores          = ncores_val,
-    is_transformed  = unpacked$is_transformed,
-    sqs_threshold   = sqs_threshold_val,
-    apply_sqs       = apply_sqs_val
+    data               = data_mat,
+    metadata           = meta,
+    dir                = outdir,
+    file.name          = file_name_ref,
+    modality           = "CyTOF",
+    cell_id_col        = "cell_id",
+    cell_type_col      = "cell_type",
+    dataset_col        = "dataset_id",
+    sample_col         = "sample_id",
+    batch_col          = "batch",
+    tissue_default     = "PBMC",
+    discretize         = TRUE,
+    sig.frames         = TRUE,
+    num.boot.sample    = nb,
+    num.cells.sample   = ns,
+    ncores             = ncores_val,
+    is_transformed     = unpacked$is_transformed,
+    sqs_threshold      = sqs_threshold_val,
+    apply_sqs          = apply_sqs_val,
+    bootstrap_stratify = bootstrap_stratify_val,
+    threshold_method   = threshold_method_val
   )
   invisible(NULL)
 }

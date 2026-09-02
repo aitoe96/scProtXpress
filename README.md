@@ -23,7 +23,7 @@ data.frame to the unified API.
 1. **Reference build.** Per-marker landmark detection
    (`ADTnorm::get_peak_mode` patched, `get_valley_location`,
    `landmark_fill_na`, `peak_alignment`).
-2. **Mode C global QC.** A single `cleanData_ADT()` pass over the
+2. **Global QC.** A single `cleanData_ADT()` pass over the
    NA-padded union matrix with marker-level coverage filtering and an
    exclusion audit CSV.
 3. **Bootstrap.** Per-marker threshold distributions
@@ -130,9 +130,9 @@ Ref_<file.name>/
   <file.name>_bg_prot_pars.rds      # per-marker fitted parameters
   <file.name>_th_dist.rds           # per-marker bootstrap thresholds
   <file.name>_sf.txt                # scaling factors (sf = 1 by default)
-  <file.name>_BackCounts.rds        # sanitised reference counts (P1)
-  <file.name>_BackMetadata.rds      # sanitised reference metadata (P1)
-  <file.name>_excluded_markers.csv  # Mode C exclusion audit
+  <file.name>_BackCounts.rds        # sanitised reference counts
+  <file.name>_BackMetadata.rds      # sanitised reference metadata
+  <file.name>_excluded_markers.csv  # marker exclusion audit
   Query_<pop>/                      # per-cell-type discretisation
     <pop>_NormData.rds
     <pop>_pvals.rds
