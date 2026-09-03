@@ -43,6 +43,9 @@ RunBootstrap(
 
 \item{bootstrap_stratify}{one of "none" (default), "cell.type",
 "cell.type_tissue". Selects the sampling strategy.}
+
+\item{threshold_method}{one of "rectangle" (default), "mixture",
+"quantile", "zscore". Selects the thresholding method.}
 }
 \value{
 list keyed by marker, each \verb{n_boot x 2 (Lower, Upper)}.

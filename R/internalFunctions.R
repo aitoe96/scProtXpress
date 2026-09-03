@@ -2446,6 +2446,8 @@ RunBackComputations <- function(norm.data, cell_clusterid_mat, ncells.sample, cl
 #' @param fixseed integer.
 #' @param bootstrap_stratify one of "none" (default), "cell.type",
 #'   "cell.type_tissue". Selects the sampling strategy.
+#' @param threshold_method one of "rectangle" (default), "mixture",
+#'   "quantile", "zscore". Selects the thresholding method.
 #' @return list keyed by marker, each `n_boot x 2 (Lower, Upper)`.
 #' @export
 RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,

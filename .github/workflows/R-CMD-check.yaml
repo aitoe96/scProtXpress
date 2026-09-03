@@ -64,3 +64,7 @@ jobs:
         with:
           upload-snapshots: true
           args: 'c("--no-manual", "--as-cran", "--no-tests", "--no-examples")'
+          # Remaining WARNINGs come from Bioconductor deps (flowStats/flowViz
+          # symbol masking, ADTnorm's C++11 SystemRequirements) at load time,
+          # not from this package's own code.
+          error-on: '"error"'
