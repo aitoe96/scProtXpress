@@ -17,7 +17,7 @@ ADTprot_norm(
   batch_col = "batch",
   marker_to_process = NULL,
   exclude_zeroes = FALSE,
-  bimodal_marker = NULL,
+  bimodal_marker = "auto",
   trimodal_marker = NULL,
   positive_peak = NULL,
   bw_smallest_bi = 1.1,
@@ -43,7 +43,16 @@ ADTprot_norm(
   apply_sqs = "none",
   do_subsample = TRUE,
   target_ct = 2000L,
-  ncores = 1L
+  ncores = 1L,
+  balance_celltypes = TRUE,
+  balance_n = 2000L,
+  balance_min_cells = 1L,
+  balance_replace = FALSE,
+  min_cells_align = 25L,
+  seed = 1234,
+  balance_celltypes_query = FALSE,
+  single_peak = c("nearest", "negative"),
+  debug = FALSE
 )
 }
 \arguments{
@@ -71,7 +80,12 @@ ADTprot_norm(
 
 \item{exclude_zeroes}{logical; ADTnorm parameter; passed through.}
 
-\item{bimodal_marker}{optional character vector; markers known to be bimodal.}
+\item{bimodal_marker}{markers on which the peak detector retries with a
+finer bandwidth when it finds fewer than two peaks (ADTnorm's
+\code{bimodal_marker}). \code{"auto"} (default): every marker when
+\code{balance_celltypes = TRUE}, none otherwise; \code{"all"}: every marker;
+\code{NULL}: none; or a character vector of marker names. Resolved to marker
+names and saved in the reference, which queries follow.}
 
 \item{trimodal_marker}{optional character vector; markers known to be trimodal.}
 
@@ -124,6 +138,55 @@ ADTprot_norm(
 \item{target_ct}{integer; cap of cells per cell type during Ref subsampling.}
 
 \item{ncores}{integer; number of cores for parallelisation.}
+
+\item{balance_celltypes}{logical (default \code{TRUE}). Detect the peaks and
+valleys of every sample on a copy of the sample in which its cell types
+are balanced (metadata column \code{cell.type}); the landmarks found there
+warp the original cells. Ref only (queries: \code{balance_celltypes_query}).}
+
+\item{balance_n}{cells per sample in the balanced copy: a number (default
+2000; 2000-5000 recommended by the evaluation of the method, 2000 is the
+cheaper), \code{"sample"} (as many cells as the sample has) or \code{"maxK"} (every
+cell type as large as the largest one). Each eligible cell type
+contributes \code{balance_n / K} cells (K eligible types): a smaller type keeps
+all its cells and is completed with draws with replacement, a larger one
+is down-sampled. Samples with fewer than two eligible types are used as
+they are.}
+
+\item{balance_min_cells}{integer (default 1); cell types with fewer cells in
+a sample are left out of its balanced copy.}
+
+\item{balance_replace}{logical (default \code{FALSE}); down-sample larger cell
+types with replacement instead of without.}
+
+\item{min_cells_align}{integer >= 5 (default 25). A sample is aligned for a
+marker only with at least this many finite values, >= 3 distinct values
+and non-zero variance; otherwise its values of that marker are set to NA.
+Ref only: queries follow the reference.}
+
+\item{seed}{integer; seed of the landmark detection of every marker
+(balanced copy and detector jitter) and of the Ref subsampling.}
+
+\item{balance_celltypes_query}{logical (default \code{FALSE}); query only.
+Detect the landmarks of the query on cell-type balanced copies, with the
+balancing settings saved in the reference.}
+
+\item{single_peak}{\code{"nearest"} (default) or \code{"negative"}; query only. A
+query sample with a single peak is aligned with that peak and its valley,
+without imputing the missing peak: \code{"nearest"} takes the peak as the
+positive one when it is nearer to the positive target of the reference
+than to the negative one (valley searched below the peak; warp onto the
+valley and positive targets), and as the negative one otherwise (warp
+onto the negative and valley targets); \code{"negative"} always takes it as
+the negative one.}
+
+\item{debug}{logical (default \code{FALSE}). Write, in \code{outdir}, what the
+alignment of every marker used: \verb{<file.id>_debug_landmarks.csv} (one row
+per marker and sample: status and why, detected peaks and valley,
+landmarks used, which were imputed and how, targets),
+\verb{<file.id>_debug/<marker>.rds} (detection and alignment objects; cells of
+the balanced copy and how many times each was drawn) and
+\verb{<file.id>_debug_settings.csv}.}
 }
 \value{
 Normalised proteins x cells matrix.
@@ -132,4 +195,10 @@ Normalised proteins x cells matrix.
 Dispatcher around \code{.ADTprot_norm_ref()} / \code{.ADTprot_norm_query()} that
 enforces SLURM-aware parallelisation and the documented Mode C QC
 filters when invoked through \code{run_scProteinXpress()}.
+}
+\details{
+Ref: a positive peak that no sample detects is imputed in every sample with
+the median of the per-sample maxima, and a positive peak at or below the
+valley of its sample is replaced by the maximum of that sample. Query: no
+positive peak is imputed (see \code{single_peak}).
 }

@@ -1,6 +1,6 @@
 Package: scProtXpress
 Title: Single-cell Protein Expression Discretisation (CyTOF + CITE-seq)
-Version: 0.2.0
+Version: 0.3.1
 Authors@R: c(
     person(given = "Aitor", family = "Martínez Pérez",
            role = c("aut", "cre"), email = "amperez@cicbiogune.es",
@@ -33,6 +33,7 @@ Depends:
     R (>= 4.1.0)
 Imports:
     ADTnorm,
+    fda,
     Matrix,
     magrittr,
     flowCore,

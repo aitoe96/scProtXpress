@@ -14,8 +14,8 @@
 #'   \item `qc_outlier_cells = "auto"` activates `scuttle::isOutlier`
 #'         only when `modality == "CITE-seq"`; "yes" / "no" force the
 #'         choice regardless of modality.
-#'   \item `num.cells.sample = NULL` resolves to 1000L for CyTOF or
-#'         100L for CITE-seq, matching the historical defaults.
+#'   \item `num.cells.sample = NULL` resolves to 1000L for both CyTOF
+#'         and CITE-seq.
 #' }
 #'
 #' @section Metadata column resolution:
@@ -57,9 +57,10 @@
 #' @param sig.frames logical. Run `Create.sig.frame()` + `discrete.expr.levels()`.
 #' @param num.boot.sample integer. Bootstrap iterations.
 #' @param num.cells.sample integer or NULL. Cells per bootstrap sample.
-#'   NULL resolves to 1000L (CyTOF) or 100L (CITE-seq).
+#'   NULL resolves to 1000L (CyTOF and CITE-seq).
 #' @param ncores integer >= 1. Workers for the inner `foreach %dopar%` loops.
-#' @param fixseed integer. Seed for reproducibility.
+#' @param fixseed integer. Seed for reproducibility: bootstrap, Ref
+#'   subsampling and the landmark detection of every marker (Ref and query).
 #' @param tissue_default character(1). Used when metadata has no `tissue`.
 #' @param modality "CyTOF" or "CITE-seq". Selects the ingest helper and
 #'   resolves auto-defaults for `qc_outlier_cells` and `num.cells.sample`.
@@ -87,7 +88,36 @@
 #' @param qc_outlier_cells "auto" (default), "yes", "no".
 #' @param qc_nmads integer. Used by the scuttle filter when active.
 #' @param do_subsample logical. Apply hierarchical subsampling of the Ref.
-#' @param target_ct integer. Per-cell-type cap for hierarchical subsampling.
+#' @param target_ct integer. Per-cell-type cap for hierarchical subsampling
+#'   (after alignment; not related to `balance_n`).
+#' @param balance_celltypes logical (default `TRUE`). Detect the peaks and
+#'   valleys of every background sample on a copy of the sample in which its
+#'   cell types are balanced; the landmarks found there warp the original
+#'   cells. See Cell-type balanced landmark detection.
+#' @param balance_n Cells per sample in the balanced copy: a number (default
+#'   2000), `"sample"` or `"maxK"`. See [ADTprot_norm()].
+#' @param balance_min_cells integer (default 1). Cell types with fewer cells
+#'   in a sample are left out of its balanced copy.
+#' @param balance_replace logical (default `FALSE`). Down-sample larger cell
+#'   types with replacement instead of without.
+#' @param bimodal_marker `"auto"` (default: every marker when
+#'   `balance_celltypes = TRUE`, none otherwise), `"all"`, `NULL` or marker
+#'   names. Markers on which the peak detector retries with a finer bandwidth
+#'   when it finds fewer than two peaks. See [ADTprot_norm()].
+#' @param min_cells_align integer >= 5 (default 25). Samples with fewer finite
+#'   values of a marker (or fewer than 3 distinct values, or zero variance)
+#'   are not aligned for it and are set to NA.
+#' @param balance_celltypes_query logical (default `FALSE`). Detect the
+#'   landmarks of the query samples on cell-type balanced copies too, with the
+#'   balancing settings of the background. See [ADTprot_norm()].
+#' @param single_peak `"nearest"` (default) or `"negative"`. Target of a
+#'   query sample with a single peak: the nearest background target (negative
+#'   or positive peak) or always the negative peak. No positive peak is
+#'   imputed in a query. See [ADTprot_norm()].
+#' @param debug logical (default `FALSE`). Write, next to the alignment log of
+#'   the background and of the query, what the alignment of every marker used
+#'   (detected and imputed landmarks, samples left out and why, settings).
+#'   See [ADTprot_norm()].
 #' @param bootstrap_stratify one of "none" (default), "cell.type",
 #'   "cell.type_tissue". Controls how cells are pooled when generating each
 #'   per-marker bootstrap iteration:
@@ -140,6 +170,59 @@
 #'   contributing donors than this are forced to `"not.significant"`
 #'   rather than a confident call. Only used when `sig_test_method !=
 #'   "pooled"`.
+#' @param fdr_method `"BH"` (default) or `NULL`. Multiple-testing correction
+#'   of the population-level calls (`sig.frames`), within each population
+#'   (its gene panel): `p_low` is Benjamini-Hochberg adjusted over every
+#'   gene (`q_low`); then `p_high` over the genes that reach the
+#'   medium/high test only, i.e. not low after `q_low` and not tied
+#'   (`q_high`). `expr.level` is called on the q-values at 0.05; the raw
+#'   p-values and the call on them (`expr.level_raw`) are kept in the
+#'   table. `NULL`: calls on the raw p-values, as before 0.3.1.
+#' @param background_groups Optional data.frame with columns `group` and
+#'   `label` (values of `cell_type_col`; a label can be in several groups).
+#'   When the background is built, besides the global thresholds one
+#'   bootstrap per group is run on the aligned background cells of its
+#'   labels, with the same settings. Saved in `<file.name>_th_dist_groups.rds`
+#'   and `<file.name>_groups.csv`; the self-query is also discretised with
+#'   the groups of each label. `NULL` (default): global thresholds only.
+#' @param query_groups Optional data.frame with columns `group` and `label`
+#'   (values of `cell_type_col` in the query; one or more rows per label).
+#'   With `precBack`, each population of the query is also discretised with
+#'   the thresholds of its groups, into `groups/<group>/Query_<label>/` and
+#'   `groups/<group>/sig_frames/`. Populations without a group (or whose
+#'   groups were not built) keep only the global discretisation and are
+#'   listed in `groups_unmatched.csv` and in a warning. `NULL` (default):
+#'   global only.
+#' @param min_cells_group,min_donors_group A group is built when the
+#'   background has more than `min_cells_group` cells (default 200) of its
+#'   labels, from at least `min_donors_group` donors (default 2; donors are
+#'   counted as dataset::donor).
+#' @section Thresholds per group of cell types:
+#' The alignment of background and queries is global and does not change
+#' with `background_groups` / `query_groups`: the groups only add thresholds
+#' and discretisations. A background already built (same folder) is reused
+#' and only the missing group outputs are computed.
+#' @section Cell-type balanced landmark detection:
+#' With `balance_celltypes = TRUE` (default) the landmarks (negative peak,
+#' valley, positive peak) of every background sample are detected on a copy
+#' of the sample with `balance_n` cells shared equally among its cell types
+#' (`cell_type_col`), so that a dominant cell type does not decide them; the
+#' original cells are then warped with those landmarks. The defaults
+#' (`balance_n = 2000`, `balance_min_cells = 1`, `balance_replace = FALSE`,
+#' `bimodal_marker = "auto"`) are those chosen in the evaluation of the
+#' method, where 2000-5000 cells per sample performed best (2000 is the
+#' cheaper). These settings, `bimodal_marker` and `min_cells_align` are saved
+#' in `<file.name>_bg_prot_pars.rds`; queries (including those run with
+#' `precBack`) use the bimodal markers and `min_cells_align` of their
+#' background, and its balancing settings when `balance_celltypes_query =
+#' TRUE` (default `FALSE`: query samples are not balanced); explicit values
+#' that differ from them are ignored with a warning. In the background, a
+#' positive peak that no sample detects is imputed with the median of the
+#' per-sample maxima, and one at or below the valley of its sample is
+#' replaced by the sample maximum; in the queries no positive peak is imputed
+#' and a single peak is aligned as set by `single_peak`. Samples set to NA or
+#' whose valley was imputed are listed in `<file.id>_alignment_log.csv`.
+#'
 #' @param ... Forwarded to internal normalisation helpers.
 #' @return `invisible(NULL)`. Side effects: files under `dir/Ref_<file.name>/`.
 #' @export
@@ -194,6 +277,18 @@ run_scProteinXpress <- function(
     ## ---- Hierarchical subsampling of the reference background ----
     do_subsample = TRUE,
     target_ct    = 2000L,
+    ## ---- Landmark detection on cell-type balanced copies ----
+    balance_celltypes = TRUE,
+    balance_n         = 2000L,
+    balance_min_cells = 1L,
+    balance_replace   = FALSE,
+    bimodal_marker    = "auto",
+    min_cells_align   = 25L,
+    ## ---- Query landmark detection and single-peak samples ----
+    balance_celltypes_query = FALSE,
+    single_peak       = c("nearest", "negative"),
+    ## ---- Alignment debug files ----
+    debug             = FALSE,
     ## ---- Bootstrap stratification (default = scGeneXpress behaviour) ----
     bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
     ## ---- Threshold estimator (rectangle = original; mixture = new) -------
@@ -202,18 +297,26 @@ run_scProteinXpress <- function(
     ## other three test across donors) ------------------------------------
     sig_test_method = c("pooled", "donor_t", "donor_wilcox", "design_effect"),
     min_donors_for_call = 2L,
+    fdr_method = "BH",
+    ## ---- Thresholds per group of cell types (optional) ------------------
+    background_groups = NULL,
+    query_groups      = NULL,
+    min_cells_group   = 200L,
+    min_donors_group  = 2L,
     ...){
 
+  .use_c_collate()
   modality             <- match.arg(modality)
   apply_sqs            <- match.arg(apply_sqs)
   qc_outlier_cells     <- match.arg(qc_outlier_cells)
   bootstrap_stratify   <- match.arg(bootstrap_stratify)
   threshold_method     <- match.arg(threshold_method)
   sig_test_method      <- match.arg(sig_test_method)
+  single_peak          <- match.arg(single_peak)
 
   ## Resolve modality-dependent default for num.cells.sample.
   if (is.null(num.cells.sample)) {
-    num.cells.sample <- if (identical(modality, "CyTOF")) 1000L else 100L
+    num.cells.sample <- if (identical(modality, "CyTOF")) 1000L else 1000L
   }
   ## is_transformed is forwarded as-is (NULL / TRUE / FALSE) to
   ## .detect_input_mode(), which interprets:
@@ -251,6 +354,10 @@ run_scProteinXpress <- function(
   }
   if (!is.numeric(ncores) || length(ncores) != 1L || ncores < 1L) stop("ncores must be a single integer >= 1")
   if (!is.numeric(target_ct) || length(target_ct) != 1L || target_ct < 1L) stop("target_ct must be a single integer >= 1")
+  .check_balance_args(balance_celltypes, balance_n, balance_min_cells, balance_replace,
+                      min_cells_align, fixseed)
+  if (!(isTRUE(balance_celltypes_query) || isFALSE(balance_celltypes_query))) stop("balance_celltypes_query must be TRUE or FALSE")
+  if (!(isTRUE(debug) || isFALSE(debug))) stop("debug must be TRUE or FALSE")
   if (!is.numeric(min.coverage.fraction) || min.coverage.fraction < 0 || min.coverage.fraction > 1) {
     stop("min.coverage.fraction must be in the range 0 to 1")
   }
@@ -282,6 +389,18 @@ run_scProteinXpress <- function(
     if (length(pb_pars) != 1L || length(pb_th) != 1L) {
       stop(sprintf("precBack does not contain a single *_bg_prot_pars.rds and *_th_dist.rds: %s", precBack))
     }
+  }
+  background_groups <- .check_group_table(background_groups, "background_groups")
+  query_groups      <- .check_group_table(query_groups, "query_groups")
+  if (!is.numeric(min_cells_group) || length(min_cells_group) != 1L || min_cells_group < 0) {
+    stop("min_cells_group must be a single number >= 0")
+  }
+  if (!is.numeric(min_donors_group) || length(min_donors_group) != 1L || min_donors_group < 1) {
+    stop("min_donors_group must be a single number >= 1")
+  }
+  if (use_precBack && !is.null(background_groups)) {
+    warning("background_groups is used when the background is built; with precBack the groups ",
+            "saved in the background are used and background_groups is ignored.", call. = FALSE)
   }
 
   ## -------------------------------------------------------------------------
@@ -373,6 +492,17 @@ run_scProteinXpress <- function(
   
   ref_dir <- file.path(dir, paste0("Ref_", file.name))
   
+  ## Alignment arguments given explicitly in this call: with a background
+  ## that already exists (precBack or cached Ref) they are compared with the
+  ## settings saved in it, which are the ones used.
+  explicit_align_args <- list()
+  if (!missing(balance_celltypes)) explicit_align_args$balance_celltypes <- balance_celltypes
+  if (!missing(balance_n))         explicit_align_args$balance_n         <- balance_n
+  if (!missing(balance_min_cells)) explicit_align_args$balance_min_cells <- balance_min_cells
+  if (!missing(balance_replace))   explicit_align_args$balance_replace   <- balance_replace
+  if (!missing(bimodal_marker))    explicit_align_args["bimodal_marker"] <- list(bimodal_marker)
+  if (!missing(min_cells_align))   explicit_align_args$min_cells_align   <- min_cells_align
+  
   #############################################################################
   ################### BACKGROUND CONSTRUCTION / SELECTION ######################
   #############################################################################
@@ -386,8 +516,8 @@ run_scProteinXpress <- function(
     metadataBack <- metadata[base::which(metadata$cell.type %in% cell.type.to.keep), , drop = FALSE]
     dataBack <- data[, base::as.character(metadataBack$cell.id), drop = FALSE]
     
-    if (base::length(cell.type.to.keep) < 2) {
-      stop("Data contains less than 2 celltypes with at least 50 cells. Background reference cannot be created.")
+    if (base::length(cell.type.to.keep) < 1) {
+      stop("Data contains no celltype with at least 50 cells. Background reference cannot be created.")
     }
     
     if (!dir.exists(ref_dir)) dir.create(ref_dir, recursive = TRUE, showWarnings = FALSE)
@@ -496,6 +626,14 @@ run_scProteinXpress <- function(
         sqs_threshold  = sqs_threshold,
         apply_sqs      = apply_sqs,
         ncores         = ncores,
+        balance_celltypes = balance_celltypes,
+        balance_n         = balance_n,
+        balance_min_cells = balance_min_cells,
+        balance_replace   = balance_replace,
+        bimodal_marker    = bimodal_marker,
+        min_cells_align   = min_cells_align,
+        seed              = fixseed,
+        debug             = debug,
         ...))
       message(sprintf("[TIMING] ADTprot_norm (Ref) elapsed: %.1fs",
                       (proc.time() - t_ref)[["elapsed"]]))
@@ -504,6 +642,7 @@ run_scProteinXpress <- function(
     } else {
       norm.data    <- readRDS(bg_norm_path)
       bg.prot.pars <- readRDS(bg_pars_path)
+      .warn_ignored_alignment_args(bg.prot.pars, explicit_align_args, "cached reference")
       # When the Ref is cached, load the persisted sanitised counts/metadata too.
       # If they don't exist (older Ref built before this fix), fall back to
       # rebuilding the sanitised data using the same global-filter logic as the main
@@ -572,13 +711,34 @@ run_scProteinXpress <- function(
     } else {
       thrs.data <- readRDS(th_path)
     }
-    
+
+    ## Thresholds per group of cell types: one bootstrap per group on the
+    ## aligned background cells of its labels, with the settings above.
+    group_thrs <- if (!is.null(background_groups)) {
+      .build_group_thresholds(norm.data, metadataBack, background_groups, ref_dir, file.name,
+                              min_cells_group = min_cells_group, min_donors_group = min_donors_group,
+                              sample_n = num.cells.sample, ncores = ncores,
+                              num.boot.sample = num.boot.sample, fixseed = fixseed,
+                              bootstrap_stratify = bootstrap_stratify,
+                              threshold_method = threshold_method)
+    } else NULL
+    ## the self-query is discretised with the groups of its own labels
+    pop_groups <- background_groups
+
   } else {
     th_file   <- list.files(path = precBack, pattern = "_th_dist\\.rds$", full.names = TRUE)
     pars_file <- list.files(path = precBack, pattern = "_bg_prot_pars\\.rds$", full.names = TRUE)
     if (length(th_file) != 1 || length(pars_file) != 1) stop("Files not found in precBack")
     thrs.data    <- readRDS(th_file[1])
     bg.prot.pars <- readRDS(pars_file[1])
+    .warn_ignored_alignment_args(bg.prot.pars, explicit_align_args, "precBack")
+    group_file <- sub("_th_dist\\.rds$", "_th_dist_groups.rds", th_file[1])
+    group_thrs <- if (file.exists(group_file)) readRDS(group_file) else NULL
+    if (!is.null(query_groups) && is.null(group_thrs)) {
+      stop("query_groups was given but the background has no thresholds per group (",
+           basename(group_file), "): build it with background_groups.")
+    }
+    pop_groups <- query_groups
   }
   
   #############################################################################
@@ -612,6 +772,14 @@ run_scProteinXpress <- function(
       ncol(dataQuery), nrow(dataQuery), length(query.cell.type.to.keep)))
   }
   
+  ## Populations x groups to discretise with the thresholds of a group
+  ## (outputs in groups/<group>/). Populations without a group, or whose
+  ## groups were not built, keep only the global discretisation; they are
+  ## named in a warning and in groups_unmatched.csv.
+  group_pairs <- .group_pairs(query.cell.type.to.keep, pop_groups, group_thrs,
+                              n_cells = table(metadataQuery$cell.type),
+                              outdir = if (!use_precBack) ref_dir else dir)
+
   if (discretize) {
     set.seed(fixseed)
     base_outdir <- if (!use_precBack) ref_dir else dir
@@ -645,7 +813,11 @@ run_scProteinXpress <- function(
         min.coverage.fraction = min.coverage.fraction,
         qc_outlier_cells      = qc_outlier_cells_resolved,
         qc_nmads              = qc_nmads,
-        ncores                = ncores
+        ncores                = ncores,
+        seed                  = fixseed,
+        balance_celltypes_query = balance_celltypes_query,
+        single_peak           = single_peak,
+        debug                 = debug
       ))
       message(sprintf("[TIMING] PrepQueryData_ADT (Query ALL) elapsed: %.1fs",
                       (proc.time() - t_q)[["elapsed"]]))
@@ -654,18 +826,21 @@ run_scProteinXpress <- function(
       saveRDS(metadataQuery2, full_query_meta_path)
     }
     
-    lapply(query.cell.type.to.keep, function(pop) {
-      pop_outdir <- base_outdir
-      disc_path <- file.path(pop_outdir, paste0("Query_", pop), paste0(pop, "_DiscretisedData.rds"))
+    ## One population discretised with the thresholds `thrs` into
+    ## <pop_outdir>/Query_<pop>/ (the global ones into base_outdir, those of a
+    ## group into base_outdir/groups/<group>/).
+    discretise_pop <- function(pop, pop_outdir, thrs) {
+      pop_file <- .path_safe(pop)
+      disc_path <- file.path(pop_outdir, paste0("Query_", pop_file), paste0(pop_file, "_DiscretisedData.rds"))
       if (file.exists(disc_path)) return(NULL)
-      
+
       pop.meta <- metadataQuery2[metadataQuery2$cell.type == pop, , drop = FALSE]
       if (nrow(pop.meta) == 0) return(NULL)
       pop.norm <- query_all_norm[, pop.meta$cell.id, drop = FALSE]
-      
-      pop_dir <- file.path(pop_outdir, paste0("Query_", pop))
+
+      pop_dir <- file.path(pop_outdir, paste0("Query_", pop_file))
       if (!dir.exists(pop_dir)) dir.create(pop_dir, recursive = TRUE)
-      saveRDS(pop.norm, file = file.path(pop_dir, paste0(pop, "_NormData.rds")))
+      saveRDS(pop.norm, file = file.path(pop_dir, paste0(pop_file, "_NormData.rds")))
       ## Persisted so discrete.expr.levels_donor() can be used from the
       ## sig.frames block below WITHOUT requiring donor-aware testing and
       ## discretization to happen in the same run_scProteinXpress() call --
@@ -673,24 +848,28 @@ run_scProteinXpress <- function(
       ## same precBack. Columns are whatever survived metadata translation
       ## (cell.id, cell.type, sample, batch, tissue, ...); only cell.id and
       ## sample are actually used downstream.
-      saveRDS(pop.meta, file = file.path(pop_dir, paste0(pop, "_Metadata.rds")))
+      saveRDS(pop.meta, file = file.path(pop_dir, paste0(pop_file, "_Metadata.rds")))
 
-      Discretise_data(pop.norm, if (!use_precBack) ref_dir else precBack, thrs.data, outdir = pop_outdir, file.id = pop)
-    })
+      Discretise_data(pop.norm, if (!use_precBack) ref_dir else precBack, thrs, outdir = pop_outdir, file.id = pop_file)
+    }
+    lapply(query.cell.type.to.keep, discretise_pop, pop_outdir = base_outdir, thrs = thrs.data)
+    for (pg in group_pairs) discretise_pop(pg$pop, file.path(base_outdir, "groups", .path_safe(pg$group)), group_thrs[[pg$group]])
   }
   if (sig.frames) {
     base_outdir <- if (!use_precBack) ref_dir else dir
-    sig_dir <- file.path(base_outdir, "sig_frames")
-    if (!dir.exists(sig_dir)) dir.create(sig_dir, recursive = TRUE)
-    sig_audit_dir <- file.path(sig_dir, "audit_excluded_genes")
-    if (!dir.exists(sig_audit_dir)) dir.create(sig_audit_dir, recursive = TRUE)
-    
-    lapply(query.cell.type.to.keep, function(pop) {
-      dfile <- file.path(base_outdir, paste0("Query_", pop), paste0(pop, "_DiscretisedData.rds"))
+    ## sig table of one population from <pop_outdir>/Query_<pop>/ into
+    ## <pop_outdir>/sig_frames/
+    sig_pop <- function(pop, pop_outdir) {
+      sig_dir <- file.path(pop_outdir, "sig_frames")
+      if (!dir.exists(sig_dir)) dir.create(sig_dir, recursive = TRUE)
+      sig_audit_dir <- file.path(sig_dir, "audit_excluded_genes")
+      if (!dir.exists(sig_audit_dir)) dir.create(sig_audit_dir, recursive = TRUE)
+      pop_file <- .path_safe(pop)
+      dfile <- file.path(pop_outdir, paste0("Query_", pop_file), paste0(pop_file, "_DiscretisedData.rds"))
       if (!file.exists(dfile)) return(NULL)
-      
+
       discrete.data <- readRDS(dfile)
-      audit_path <- file.path(sig_audit_dir, paste0(pop, "_excluded_from_baseline.csv"))
+      audit_path <- file.path(sig_audit_dir, paste0(pop_file, "_excluded_from_baseline.csv"))
 
       ## Load the per-population donor/sample metadata persisted alongside
       ## the discretised data (see the `discretize` block above) so
@@ -699,7 +878,7 @@ run_scProteinXpress <- function(
       ## .compute_sig_table_for_population) if this Query_<pop> directory
       ## predates that -- e.g. built by an older version of this function,
       ## or via a precBack pointing at one.
-      pop_meta_path <- file.path(base_outdir, paste0("Query_", pop), paste0(pop, "_Metadata.rds"))
+      pop_meta_path <- file.path(pop_outdir, paste0("Query_", pop_file), paste0(pop_file, "_Metadata.rds"))
       pop_meta <- if (file.exists(pop_meta_path)) readRDS(pop_meta_path) else NULL
 
       sig.tbl <- .compute_sig_table_for_population(
@@ -707,14 +886,176 @@ run_scProteinXpress <- function(
         min.coverage.fraction.sigframe = min.coverage.fraction.sigframe,
         audit_path           = audit_path,
         sig_test_method      = sig_test_method,
-        min_donors_for_call  = min_donors_for_call
+        min_donors_for_call  = min_donors_for_call,
+        fdr_method           = fdr_method
       )
-      
-      write.table(sig.tbl, file.path(sig_dir, paste0(pop, "_sig_tbl.txt")),
+
+      write.table(sig.tbl, file.path(sig_dir, paste0(pop_file, "_sig_tbl.txt")),
                   sep = "\t", row.names = FALSE, quote = FALSE)
-    })
+    }
+    if (!dir.exists(file.path(base_outdir, "sig_frames", "audit_excluded_genes"))) {
+      dir.create(file.path(base_outdir, "sig_frames", "audit_excluded_genes"), recursive = TRUE)
+    }
+    lapply(query.cell.type.to.keep, sig_pop, pop_outdir = base_outdir)
+    for (pg in group_pairs) sig_pop(pg$pop, file.path(base_outdir, "groups", .path_safe(pg$group)))
   }
   ## Returns invisible(NULL): file outputs under dir/Ref_<file.name>/ are the
   ## actual product of a run_scProteinXpress() call, not the return value.
   invisible(NULL)
+}
+
+## Queries are aligned with the settings saved in their background
+## (bg.prot.pars$global_settings; see .ADTprot_norm_query()). Explicit
+## arguments of run_scProteinXpress() that differ from them are ignored, with
+## a warning that names them.
+.warn_ignored_alignment_args <- function(bg.prot.pars, args, source) {
+  if (length(args) == 0L) return(invisible(character(0)))
+  gs <- bg.prot.pars$global_settings
+  saved_balance <- !is.null(gs$alignment_version) && isTRUE(gs$balance_celltypes)
+  same <- function(a, b) isTRUE(all.equal(a, b, check.attributes = FALSE))
+  differ <- character(0)
+  if (!is.null(args$balance_celltypes) && !identical(args$balance_celltypes, saved_balance)) {
+    differ <- c(differ, "balance_celltypes")
+  }
+  if (saved_balance) {
+    for (a in c("balance_n", "balance_min_cells", "balance_replace")) {
+      if (!is.null(args[[a]]) && !same(args[[a]], gs[[a]])) differ <- c(differ, a)
+    }
+  }
+  if (!is.null(args$min_cells_align) &&
+      !same(args$min_cells_align, if (is.null(gs$min_cells_align)) 25L else gs$min_cells_align)) {
+    differ <- c(differ, "min_cells_align")
+  }
+  if ("bimodal_marker" %in% names(args)) {
+    flag <- if (is.null(args$balance_celltypes)) saved_balance else args$balance_celltypes
+    wanted <- .resolve_bimodal_marker(args$bimodal_marker, flag, bg.prot.pars$original_marker_name)
+    if (!setequal(wanted, gs$bimodal_marker)) differ <- c(differ, "bimodal_marker")
+  }
+  if (length(differ) > 0L) {
+    warning(sprintf(paste0("%s: the query is aligned with the settings saved in the background; ",
+                           "these arguments differ from them and are ignored: %s."),
+                    source, paste(differ, collapse = ", ")), call. = FALSE)
+  }
+  invisible(differ)
+}
+
+## Cell-type labels are used in file and folder names (Query_<label>/...).
+## "/" and "\\" would create subfolders, so they are replaced by "_" in paths
+## only; the labels themselves are not changed.
+.path_safe <- function(x) gsub("[/\\\\]", "_", x)
+
+## ---------------------------------------------------------------------------
+## Thresholds per group of cell types
+## ---------------------------------------------------------------------------
+
+## A group table (background_groups / query_groups): data.frame with columns
+## `group` and `label` (a label can be in several groups). NULL stays NULL.
+.check_group_table <- function(tab, what) {
+  if (is.null(tab)) return(NULL)
+  if (!is.data.frame(tab) || !all(c("group", "label") %in% names(tab))) {
+    stop(what, " must be a data.frame with columns 'group' and 'label'")
+  }
+  tab <- data.frame(group = as.character(tab$group), label = as.character(tab$label), stringsAsFactors = FALSE)
+  if (anyNA(tab) || any(!nzchar(tab$group)) || any(!nzchar(tab$label))) {
+    stop(what, " has empty or missing groups or labels")
+  }
+  if (nrow(tab) == 0L) stop(what, " has no rows")
+  unique(tab)
+}
+
+## One bootstrap per group, on the aligned background cells (norm.data, after
+## the hierarchical subsampling) of the labels of the group, with the same
+## settings as the global bootstrap. A group is built when the background has
+## more than `min_cells_group` cells of its labels from at least
+## `min_donors_group` donors (dataset::donor). Writes
+## <file.name>_th_dist_groups.rds (group -> marker -> thresholds),
+## <file.name>_groups.csv (cells, donors, built or why not) and, per group,
+## groups/<group>/ (the bootstrap files). Reused when it already exists.
+.build_group_thresholds <- function(norm.data, metadataBack, groups, ref_dir, file.name,
+                                    min_cells_group, min_donors_group, sample_n, ncores,
+                                    num.boot.sample, fixseed, bootstrap_stratify, threshold_method) {
+  out_rds <- file.path(ref_dir, paste0(file.name, "_th_dist_groups.rds"))
+  out_csv <- file.path(ref_dir, paste0(file.name, "_groups.csv"))
+  if (file.exists(out_rds) && file.exists(out_csv)) {
+    saved <- utils::read.csv(out_csv, stringsAsFactors = FALSE)
+    asked <- vapply(split(groups$label, groups$group), function(l) paste(sort(unique(l), method = "radix"), collapse = "; "), "")
+    if (!identical(sort(names(asked), method = "radix"), sort(saved$group, method = "radix")) ||
+        !identical(unname(asked[saved$group]), saved$labels)) {
+      stop("the thresholds per group saved in ", ref_dir, " were built with other groups; ",
+           "remove ", basename(out_rds), " and ", basename(out_csv), " to rebuild them.")
+    }
+    message("[groups] Reusing ", basename(out_rds))
+    return(readRDS(out_rds))
+  }
+  donor_key <- paste(metadataBack$dataset, metadataBack$donor, sep = "::")
+  by_group  <- split(groups$label, groups$group)
+  res <- list(); log <- list()
+  for (g in sort(names(by_group), method = "radix")) {
+    labs <- sort(unique(by_group[[g]]), method = "radix")
+    sel  <- metadataBack$cell.type %in% labs
+    n_cells  <- sum(sel)
+    n_donors <- length(unique(donor_key[sel]))
+    cells_boot <- intersect(colnames(norm.data), as.character(metadataBack$cell.id[sel]))
+    reason <- if (n_cells <= min_cells_group) {
+      sprintf("%d cells (needs more than %d)", n_cells, as.integer(min_cells_group))
+    } else if (n_donors < min_donors_group) {
+      sprintf("%d donors (needs at least %d)", n_donors, as.integer(min_donors_group))
+    } else if (length(cells_boot) == 0L) {
+      "no cells after the subsampling of the background"
+    } else NA_character_
+    if (is.na(reason)) {
+      message(sprintf("[groups] %s: bootstrap on %d cells (%d in the background, %d donors)",
+                      g, length(cells_boot), n_cells, n_donors))
+      res[[g]] <- GetBackground(norm.data[, cells_boot, drop = FALSE],
+                                file.path(ref_dir, "groups", .path_safe(g)), file.name,
+                                metadataBack[sel, , drop = FALSE],
+                                sample_n = sample_n, parallelize = TRUE, ncores = ncores,
+                                num.boot.sample = num.boot.sample, fixseed = fixseed,
+                                bootstrap_stratify = bootstrap_stratify,
+                                threshold_method = threshold_method)
+    }
+    log[[g]] <- data.frame(group = g, labels = paste(labs, collapse = "; "),
+                           labels_present = paste(intersect(labs, unique(metadataBack$cell.type)), collapse = "; "),
+                           n_cells = n_cells, n_donors = n_donors, n_cells_bootstrap = length(cells_boot),
+                           built = is.na(reason), reason = reason, stringsAsFactors = FALSE)
+  }
+  log <- do.call(rbind, log)
+  utils::write.csv(log, out_csv, row.names = FALSE)
+  saveRDS(res, out_rds)
+  if (any(!log$built)) {
+    warning(sprintf("%d of %d groups not built (see %s): %s", sum(!log$built), nrow(log),
+                    basename(out_csv), paste(log$group[!log$built], collapse = ", ")), call. = FALSE)
+  }
+  res
+}
+
+## Population x group pairs to discretise with the thresholds of a group.
+## Populations of the query without a group, or whose groups were not built,
+## are listed in <outdir>/groups_unmatched.csv and in a warning.
+.group_pairs <- function(pops, pop_groups, group_thrs, n_cells, outdir) {
+  if (is.null(pop_groups) || is.null(group_thrs)) return(list())
+  pairs <- list(); unmatched <- list()
+  for (pop in pops) {
+    gs <- sort(unique(pop_groups$group[pop_groups$label == pop]), method = "radix")
+    ok <- gs[gs %in% names(group_thrs)]
+    for (g in ok) pairs[[length(pairs) + 1L]] <- list(pop = pop, group = g)
+    reason <- if (length(gs) == 0L) "no group" else if (length(ok) == 0L) "groups not built" else
+      if (length(ok) < length(gs)) "some groups not built" else NA_character_
+    if (!is.na(reason)) {
+      unmatched[[length(unmatched) + 1L]] <- data.frame(
+        population = pop, n_cells = as.integer(n_cells[pop]),
+        groups = paste(gs, collapse = "; "), groups_not_built = paste(setdiff(gs, ok), collapse = "; "),
+        reason = reason, stringsAsFactors = FALSE)
+    }
+  }
+  um <- if (length(unmatched)) do.call(rbind, unmatched) else
+    data.frame(population = character(0), n_cells = integer(0), groups = character(0),
+               groups_not_built = character(0), reason = character(0))
+  utils::write.csv(um, file.path(outdir, "groups_unmatched.csv"), row.names = FALSE)
+  none <- um$population[um$reason %in% c("no group", "groups not built")]
+  if (length(none)) {
+    warning(sprintf("%d populations have only the global discretisation (no group with thresholds; see groups_unmatched.csv): %s",
+                    length(none), paste(none, collapse = ", ")), call. = FALSE)
+  }
+  pairs
 }

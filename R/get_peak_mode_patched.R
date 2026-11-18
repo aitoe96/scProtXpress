@@ -44,6 +44,12 @@ NULL
 #     (output of `diff -u ADTnorm-main/R/get_peak_mode.R
 #                          cytof_scProt/get_peak_mode_patched.R`).
 #
+# (c2) Samples with no peak above `lower_peak_thres` (typically samples of
+#     ~5-25 cells) are recorded as undetected (NA) and imputed by
+#     ADTnorm::landmark_fill_na(), as samples with a single value already are.
+#     Upstream, `1:length(res)` with `res` empty fails and the whole marker is
+#     lost for every sample.
+#
 # (d) TODO (low priority): submit the patch upstream to
 #     yezhengSTAT/ADTnorm and remove this file once a release containing
 #     it lands on CRAN/Bioconductor.
@@ -391,10 +397,20 @@ NULL
                 }
 
                 ## record peak mode and peak regions
-                peak_num = max(peak_num, length(res))
-                peak_mode[[sample_name]] = res
-                peak_region[[sample_name]] = matrix(NA, ncol = 2, nrow = length(res))
-                peak_region[[sample_name]][1:length(res), ] = res_region
+                if (length(res) == 0) {
+                    ## scProtXpress patch: no peak passed lower_peak_thres (seen in
+                    ## samples of ~5-25 cells). Record the sample as undetected (NA,
+                    ## as for single-value samples above) so landmark_fill_na()
+                    ## imputes its landmarks, instead of failing on
+                    ## 1:length(res) == c(1, 0) and losing the whole marker.
+                    peak_mode[[sample_name]] = NA
+                    peak_region[[sample_name]] = matrix(NA, ncol = 2, nrow = 1)
+                } else {
+                    peak_num = max(peak_num, length(res))
+                    peak_mode[[sample_name]] = res
+                    peak_region[[sample_name]] = matrix(NA, ncol = 2, nrow = length(res))
+                    peak_region[[sample_name]][1:length(res), ] = res_region
+                }
 
             }
 

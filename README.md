@@ -21,8 +21,17 @@ data.frame to the unified API.
 ## Method outline
 
 1. **Reference build.** Per-marker landmark detection
-   (`ADTnorm::get_peak_mode` patched, `get_valley_location`,
-   `landmark_fill_na`, `peak_alignment`).
+   (`ADTnorm::get_peak_mode` and `get_valley_location` patched,
+   `landmark_fill_na`) on a copy of every sample in which its cell types
+   are balanced (`balance_celltypes`, default on); a positive peak missing
+   in every sample is imputed with the median of the per-sample maxima; the
+   landmarks warp the original cells (`fda::landmarkreg`, sample by sample
+   if the whole call fails). Queries are aligned onto the landmark targets
+   of their reference, with its detection settings, without cell-type
+   balancing (`balance_celltypes_query`, default off) and without imputing
+   the positive peak: a single peak goes to the nearest target
+   (`single_peak`). `debug = TRUE` writes the landmarks of every marker and
+   sample.
 2. **Global QC.** A single `cleanData_ADT()` pass over the
    NA-padded union matrix with marker-level coverage filtering and an
    exclusion audit CSV.
@@ -166,11 +175,14 @@ sbatch inst/slurm/scProtXpress.sh CITE-seq
 * **ADTnorm** (GPL-3) by Ye Zheng et al. ([yezhengSTAT/ADTnorm](https://github.com/yezhengSTAT/ADTnorm)).
   Imported as a regular dependency. `R/get_peak_mode_patched.R` is a
   local fork of `ADTnorm::get_peak_mode` that re-introduces
-  `, drop = FALSE` at 12 internal subset operations; everything else
-  delegates to upstream ADTnorm. The patch is enumerated in the file
-  header and machine-readable as `inst/extdata/get_peak_mode.diff`
-  (also shipped at `cytof_scProt/get_peak_mode.diff` in the source
-  history).
+  `, drop = FALSE` at 12 internal subset operations; the patch is
+  enumerated in the file header and machine-readable as
+  `inst/extdata/get_peak_mode.diff` (also shipped at
+  `cytof_scProt/get_peak_mode.diff` in the source history).
+  `R/get_valley_location_patched.R` and `R/peak_alignment_scprot.R` are
+  local copies of `ADTnorm::get_valley_location` and of the fork's
+  `peak_alignment`, with their changes listed in the file headers.
+  Everything else delegates to upstream ADTnorm.
 * **scGeneXpress** (GPL-2) by Sascha Jung et al.
   ([saschajung/scGeneXpress](https://github.com/saschajung/scGeneXpress)).
   No code from scGeneXpress is vendored; its discretisation +
@@ -184,5 +196,6 @@ statistical idea.
 ## Licence
 
 `scProtXpress` is distributed under GPL-3 (see `LICENSE.md`). GPL-3 is
-required because the package vendors a single function derived from
-GPL-3-licensed ADTnorm (`R/get_peak_mode_patched.R`).
+required because the package vendors functions derived from
+GPL-3-licensed ADTnorm (`R/get_peak_mode_patched.R`,
+`R/get_valley_location_patched.R`, `R/peak_alignment_scprot.R`).

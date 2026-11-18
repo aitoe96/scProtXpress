@@ -9,7 +9,8 @@ discrete.expr.levels_donor(
   prob_low,
   prob_high,
   test_method = c("donor_t", "donor_wilcox", "design_effect"),
-  min_donors_for_call = 2L
+  min_donors_for_call = 2L,
+  fdr_method = NULL
 )
 }
 \arguments{
@@ -46,6 +47,12 @@ gene fall back to the original pooled \code{pbinom} test for that gene
 contributing donors than this are forced to \code{"not.significant"}
 rather than silently falling back to a pooled-cell test that offers no
 real protection against pseudoreplication.}
+
+\item{fdr_method}{\code{NULL} (default: calls on the raw p-values) or \code{"BH"}:
+\code{p_low} is Benjamini-Hochberg adjusted over the genes with enough
+donors (\code{q_low}), then \code{p_high} over the genes that reach the
+medium/high test only (\code{q_high}); the calls use the q-values and
+\code{expr.level_raw} keeps the call on the raw p-values.}
 }
 \value{
 data.frame: gene, per-donor-summed n.0/n.0.5/n.1 (for

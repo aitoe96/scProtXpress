@@ -36,10 +36,24 @@ run_scProteinXpress(
   qc_nmads = 3,
   do_subsample = TRUE,
   target_ct = 2000L,
+  balance_celltypes = TRUE,
+  balance_n = 2000L,
+  balance_min_cells = 1L,
+  balance_replace = FALSE,
+  bimodal_marker = "auto",
+  min_cells_align = 25L,
+  balance_celltypes_query = FALSE,
+  single_peak = c("nearest", "negative"),
+  debug = FALSE,
   bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
   threshold_method = c("rectangle", "mixture", "quantile", "zscore"),
   sig_test_method = c("pooled", "donor_t", "donor_wilcox", "design_effect"),
   min_donors_for_call = 2L,
+  fdr_method = "BH",
+  background_groups = NULL,
+  query_groups = NULL,
+  min_cells_group = 200L,
+  min_donors_group = 2L,
   ...
 )
 }
@@ -67,11 +81,12 @@ instead of building.}
 \item{num.boot.sample}{integer. Bootstrap iterations.}
 
 \item{num.cells.sample}{integer or NULL. Cells per bootstrap sample.
-NULL resolves to 1000L (CyTOF) or 100L (CITE-seq).}
+NULL resolves to 1000L (CyTOF and CITE-seq).}
 
 \item{ncores}{integer >= 1. Workers for the inner \verb{foreach \%dopar\%} loops.}
 
-\item{fixseed}{integer. Seed for reproducibility.}
+\item{fixseed}{integer. Seed for reproducibility: bootstrap, Ref
+subsampling and the landmark detection of every marker (Ref and query).}
 
 \item{tissue_default}{character(1). Used when metadata has no \code{tissue}.}
 
@@ -112,7 +127,45 @@ coverage filter for \code{Create.sig.frame()} baseline.}
 
 \item{do_subsample}{logical. Apply hierarchical subsampling of the Ref.}
 
-\item{target_ct}{integer. Per-cell-type cap for hierarchical subsampling.}
+\item{target_ct}{integer. Per-cell-type cap for hierarchical subsampling
+(after alignment; not related to \code{balance_n}).}
+
+\item{balance_celltypes}{logical (default \code{TRUE}). Detect the peaks and
+valleys of every background sample on a copy of the sample in which its
+cell types are balanced; the landmarks found there warp the original
+cells. See Cell-type balanced landmark detection.}
+
+\item{balance_n}{Cells per sample in the balanced copy: a number (default
+2000), \code{"sample"} or \code{"maxK"}. See \code{\link[=ADTprot_norm]{ADTprot_norm()}}.}
+
+\item{balance_min_cells}{integer (default 1). Cell types with fewer cells
+in a sample are left out of its balanced copy.}
+
+\item{balance_replace}{logical (default \code{FALSE}). Down-sample larger cell
+types with replacement instead of without.}
+
+\item{bimodal_marker}{\code{"auto"} (default: every marker when
+\code{balance_celltypes = TRUE}, none otherwise), \code{"all"}, \code{NULL} or marker
+names. Markers on which the peak detector retries with a finer bandwidth
+when it finds fewer than two peaks. See \code{\link[=ADTprot_norm]{ADTprot_norm()}}.}
+
+\item{min_cells_align}{integer >= 5 (default 25). Samples with fewer finite
+values of a marker (or fewer than 3 distinct values, or zero variance)
+are not aligned for it and are set to NA.}
+
+\item{balance_celltypes_query}{logical (default \code{FALSE}). Detect the
+landmarks of the query samples on cell-type balanced copies too, with the
+balancing settings of the background. See \code{\link[=ADTprot_norm]{ADTprot_norm()}}.}
+
+\item{single_peak}{\code{"nearest"} (default) or \code{"negative"}. Target of a
+query sample with a single peak: the nearest background target (negative
+or positive peak) or always the negative peak. No positive peak is
+imputed in a query. See \code{\link[=ADTprot_norm]{ADTprot_norm()}}.}
+
+\item{debug}{logical (default \code{FALSE}). Write, next to the alignment log of
+the background and of the query, what the alignment of every marker used
+(detected and imputed landmarks, samples left out and why, settings).
+See \code{\link[=ADTprot_norm]{ADTprot_norm()}}.}
 
 \item{bootstrap_stratify}{one of "none" (default), "cell.type",
 "cell.type_tissue". Controls how cells are pooled when generating each
@@ -170,6 +223,37 @@ the population) for any population where that isn't available, e.g. a
 contributing donors than this are forced to \code{"not.significant"}
 rather than a confident call. Only used when \code{sig_test_method != "pooled"}.}
 
+\item{fdr_method}{\code{"BH"} (default) or \code{NULL}. Multiple-testing correction
+of the population-level calls (\code{sig.frames}), within each population
+(its gene panel): \code{p_low} is Benjamini-Hochberg adjusted over every
+gene (\code{q_low}); then \code{p_high} over the genes that reach the
+medium/high test only, i.e. not low after \code{q_low} and not tied
+(\code{q_high}). \code{expr.level} is called on the q-values at 0.05; the raw
+p-values and the call on them (\code{expr.level_raw}) are kept in the
+table. \code{NULL}: calls on the raw p-values, as before 0.3.1.}
+
+\item{background_groups}{Optional data.frame with columns \code{group} and
+\code{label} (values of \code{cell_type_col}; a label can be in several groups).
+When the background is built, besides the global thresholds one
+bootstrap per group is run on the aligned background cells of its
+labels, with the same settings. Saved in \verb{<file.name>_th_dist_groups.rds}
+and \verb{<file.name>_groups.csv}; the self-query is also discretised with
+the groups of each label. \code{NULL} (default): global thresholds only.}
+
+\item{query_groups}{Optional data.frame with columns \code{group} and \code{label}
+(values of \code{cell_type_col} in the query; one or more rows per label).
+With \code{precBack}, each population of the query is also discretised with
+the thresholds of its groups, into \verb{groups/<group>/Query_<label>/} and
+\verb{groups/<group>/sig_frames/}. Populations without a group (or whose
+groups were not built) keep only the global discretisation and are
+listed in \code{groups_unmatched.csv} and in a warning. \code{NULL} (default):
+global only.}
+
+\item{min_cells_group, min_donors_group}{A group is built when the
+background has more than \code{min_cells_group} cells (default 200) of its
+labels, from at least \code{min_donors_group} donors (default 2; donors are
+counted as dataset::donor).}
+
 \item{...}{Forwarded to internal normalisation helpers.}
 }
 \value{
@@ -191,8 +275,8 @@ ingest step branches on \code{modality}.
 \item \code{qc_outlier_cells = "auto"} activates \code{scuttle::isOutlier}
 only when \code{modality == "CITE-seq"}; "yes" / "no" force the
 choice regardless of modality.
-\item \code{num.cells.sample = NULL} resolves to 1000L for CyTOF or
-100L for CITE-seq, matching the historical defaults.
+\item \code{num.cells.sample = NULL} resolves to 1000L for both CyTOF
+and CITE-seq.
 }
 }
 
@@ -223,5 +307,35 @@ name used by everything downstream (\code{cell.id}, \code{cell.type}, \code{data
 \code{.detect_input_mode()} (autodetect by integer-coercibility).
 Explicit TRUE / FALSE overrides detection (TRUE = "already
 transformed, skip arcsinh"; FALSE = "force apply arcsinh").
+}
+
+\section{Thresholds per group of cell types}{
+
+The alignment of background and queries is global and does not change
+with \code{background_groups} / \code{query_groups}: the groups only add thresholds
+and discretisations. A background already built (same folder) is reused
+and only the missing group outputs are computed.
+}
+
+\section{Cell-type balanced landmark detection}{
+
+With \code{balance_celltypes = TRUE} (default) the landmarks (negative peak,
+valley, positive peak) of every background sample are detected on a copy
+of the sample with \code{balance_n} cells shared equally among its cell types
+(\code{cell_type_col}), so that a dominant cell type does not decide them; the
+original cells are then warped with those landmarks. The defaults
+(\code{balance_n = 2000}, \code{balance_min_cells = 1}, \code{balance_replace = FALSE},
+\code{bimodal_marker = "auto"}) are those chosen in the evaluation of the
+method, where 2000-5000 cells per sample performed best (2000 is the
+cheaper). These settings, \code{bimodal_marker} and \code{min_cells_align} are saved
+in \verb{<file.name>_bg_prot_pars.rds}; queries (including those run with
+\code{precBack}) use the bimodal markers and \code{min_cells_align} of their
+background, and its balancing settings when \code{balance_celltypes_query = TRUE} (default \code{FALSE}: query samples are not balanced); explicit values
+that differ from them are ignored with a warning. In the background, a
+positive peak that no sample detects is imputed with the median of the
+per-sample maxima, and one at or below the valley of its sample is
+replaced by the sample maximum; in the queries no positive peak is imputed
+and a single peak is aligned as set by \code{single_peak}. Samples set to NA or
+whose valley was imputed are listed in \verb{<file.id>_alignment_log.csv}.
 }
 

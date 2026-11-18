@@ -23,7 +23,11 @@ PrepQueryData_ADT(
   min.coverage.fraction = 0.1,
   qc_outlier_cells = c("no", "yes"),
   qc_nmads = 3,
-  ncores = 1L
+  ncores = 1L,
+  seed = 1234,
+  balance_celltypes_query = FALSE,
+  single_peak = c("nearest", "negative"),
+  debug = FALSE
 )
 }
 \arguments{
@@ -55,6 +59,13 @@ and \verb{_bg_prot_pars.rds}) or an in-memory list.}
 \item{qc_nmads}{MAD threshold for scuttle::isOutlier.}
 
 \item{ncores}{integer >= 1.}
+
+\item{seed}{integer; seed of the landmark detection of every marker. The
+other detection settings (bimodal markers, \code{min_cells_align}, balancing
+settings) are those saved in \code{bg.prot.pars}.}
+
+\item{balance_celltypes_query, single_peak, debug}{see \code{\link[=ADTprot_norm]{ADTprot_norm()}}
+(defaults \code{FALSE}, \code{"nearest"}, \code{FALSE}).}
 }
 \value{
 Scaled proteins x cells matrix.

@@ -484,10 +484,346 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   landmark_matrix
 }
 
+# Positive peak of the reference landmarks (negative peak, valley, positive
+# peak). When no sample detects it, every sample gets the median of the
+# per-sample maxima; a positive peak at or below the valley of its sample is
+# replaced by the maximum of that sample. `x` and `sample`: values (all cells,
+# before alignment) and samples of the cells of `valid_samples`. Returns the
+# landmark matrix and, per sample, the method used ("median_of_max",
+# "sample_max" or NA).
+.impute_positive_peak <- function(landmark_matrix, x, sample, valid_samples) {
+  if (ncol(landmark_matrix) == 2L) landmark_matrix <- cbind(landmark_matrix, NA_real_)
+  smax <- tapply(x, sample, max, na.rm = TRUE)[valid_samples]
+  method <- stats::setNames(rep(NA_character_, length(valid_samples)), valid_samples)
+  if (all(is.na(landmark_matrix[valid_samples, 3]))) {
+    landmark_matrix[valid_samples, 3] <- stats::median(smax)
+    method[] <- "median_of_max"
+  }
+  low <- valid_samples[which(landmark_matrix[valid_samples, 3] <= landmark_matrix[valid_samples, 2])]
+  landmark_matrix[low, 3] <- smax[low]
+  method[low] <- "sample_max"
+  list(landmark_matrix = landmark_matrix, method = method)
+}
+
 .extract_align_field <- function(align_res, field, fallback = NULL, pos = NULL) {
   if (is.list(align_res) && field %in% names(align_res)) return(align_res[[field]])
   if (!is.null(pos) && length(align_res) >= pos) return(align_res[[pos]])
   fallback
+}
+
+# Result of a marker that could not be aligned. The ADTprot_norm master sets
+# the whole marker to NA (unaligned values must not enter the pipeline) and
+# reports `reason` (the failing step and its error), so the cause can be traced
+# even when the marker ran in a parallel worker.
+.marker_not_aligned <- function(marker_name, tmp_name, reason, sqs_rows = list(),
+                                align_log = .align_log_rows()) {
+  list(marker_name = marker_name, tmp_name = tmp_name, norm_col_override = NULL,
+       pars = NULL, sqs_rows = sqs_rows, not_aligned = reason, align_log = align_log)
+}
+
+# -----------------------------------------------------------------------------
+# Alignment version written to <file.id>_bg_prot_pars.rds (global_settings).
+# Backgrounds without it were built with scProtXpress <= 0.2.0: their queries
+# are aligned as those backgrounds were (no cell-type balancing, valley call of
+# that version), see .ADTprot_norm_query().
+# -----------------------------------------------------------------------------
+.ALIGNMENT_VERSION <- "0.3.0"
+
+# Samples of one marker that were set to NA or had their valley imputed, for
+# the messages and <file.id>_alignment_log.csv. Reasons:
+#   too_small         1 to min_cells_align - 1 finite values: not aligned (NA)
+#   not_valid         < 3 distinct values or variance <= 1e-6: not aligned (NA)
+#   warp_failed       fda::landmarkreg failed for the sample: NA (bug B)
+#   no_valley_imputed single peak without valley or shoulder: valley imputed
+#                     by ADTnorm::landmark_fill_na(), sample aligned
+.align_log_rows <- function(samples = character(0), reason = character(0)) {
+  data.frame(sample = as.character(samples), reason = rep(reason, length.out = length(samples)),
+             stringsAsFactors = FALSE)
+}
+
+# Samples of one marker that can be aligned: >= min_cells_align finite values,
+# >= 3 distinct values and variance > 1e-6. The others are returned with the
+# reason they are left out (samples without any value are not reported).
+.alignable_samples <- function(x, sample, min_cells_align) {
+  valid <- character(0); log <- .align_log_rows()
+  for (s in levels(sample)) {
+    v <- x[sample == s]
+    v <- v[is.finite(v)]
+    if (length(v) == 0L) next
+    if (length(v) < min_cells_align) {
+      log <- rbind(log, .align_log_rows(s, "too_small"))
+    } else if (length(unique(v)) < 3L || stats::var(v) <= 1e-6) {
+      log <- rbind(log, .align_log_rows(s, "not_valid"))
+    } else {
+      valid <- c(valid, s)
+    }
+  }
+  list(valid = valid, log = log)
+}
+
+# -----------------------------------------------------------------------------
+# Cell-type balancing of the landmark detection input
+#
+# Peaks and valleys of every sample are detected on a copy of the sample in
+# which its cell types are balanced; the landmarks found there warp the
+# ORIGINAL cells, and the copy is discarded. This keeps a dominant cell type
+# from deciding the landmarks of a sample.
+# -----------------------------------------------------------------------------
+# Indices (into `ct`, the cell types of the cells of one sample) of its
+# balanced copy. K = cell types with >= min_cells cells. With K < 2 the sample
+# is used as it is. Otherwise every eligible type contributes `per` cells:
+#   n numeric:  round(n / K);  n = "sample": round(cells of the sample / K);
+#   n = "maxK": cells of the largest eligible type.
+# A type with fewer cells keeps all of them and is completed with draws with
+# replacement; a larger one is down-sampled without replacement (with
+# replacement if replace = TRUE). Types below min_cells are left out. Types
+# are taken in C-locale order, so a seed gives the same copy on any machine.
+.balance_index <- function(ct, n, min_cells, replace) {
+  tab <- table(factor(ct, levels = sort(unique(ct), method = "radix")))
+  elig <- names(tab)[tab >= min_cells]
+  K <- length(elig)
+  if (K < 2L) return(seq_along(ct))
+  per <- as.integer(if (identical(n, "maxK")) max(tab[elig]) else
+    max(1, round((if (identical(n, "sample")) length(ct) else n) / K)))
+  unlist(lapply(elig, function(t) {
+    i <- which(ct == t); m <- length(i)
+    if (per >= m) c(i, i[sample.int(m, per - m, replace = TRUE)])
+    else i[sample.int(m, per, replace = isTRUE(replace))]
+  }), use.names = FALSE)
+}
+
+# Cell types, tissues and datasets are ordered (factor(), table()) before
+# cells are drawn in the hierarchical subsampling and the bootstrap, so the
+# draws would depend on the collation of the machine. The exported entry
+# points call this first: they run in C collation and restore the caller's on
+# exit, so a seed gives the same result in any locale.
+.use_c_collate <- function(frame = parent.frame()) {
+  old <- Sys.getlocale("LC_COLLATE")
+  if (identical(old, "C")) return(invisible(NULL))
+  do.call(on.exit, list(bquote(invisible(Sys.setlocale("LC_COLLATE", .(old)))), add = TRUE),
+          envir = frame)
+  invisible(Sys.setlocale("LC_COLLATE", "C"))
+}
+
+# Balanced copy of the detection input of one marker: the cells with a finite
+# value of every sample (in the order of levels(sample)), resampled by
+# .balance_index(). Returns the one-column matrix and the feature frame
+# (sample, batch) that the detection steps take, and `keep`, the index in `x`
+# of every cell of the copy.
+.balanced_detection_input <- function(x, sample, batch, cell_type, adt_marker_select,
+                                      n, min_cells, replace) {
+  keep <- unlist(lapply(levels(sample), function(s) {
+    i <- which(sample == s & is.finite(x))
+    if (length(i)) i[.balance_index(cell_type[i], n, min_cells, replace)]
+  }), use.names = FALSE)
+  list(cell_x_adt     = matrix(x[keep], ncol = 1L, dimnames = list(NULL, adt_marker_select)),
+       cell_x_feature = data.frame(sample = factor(as.character(sample[keep]), levels = levels(sample)),
+                                   batch = batch[keep], stringsAsFactors = FALSE),
+       keep           = keep)
+}
+
+# Cell types of the cells for the balanced copy; NULL when balancing is off.
+.balance_cell_types <- function(cell_x_feature, ct_col, balance_celltypes) {
+  if (!isTRUE(balance_celltypes)) return(NULL)
+  if (!ct_col %in% colnames(cell_x_feature)) {
+    stop("balance_celltypes = TRUE needs the cell type of every cell (metadata column '", ct_col,
+         "'), which is missing. Set balance_celltypes = FALSE to detect the landmarks without balancing.",
+         call. = FALSE)
+  }
+  ct <- as.character(cell_x_feature[[ct_col]])
+  if (anyNA(ct) || any(ct == "")) {
+    stop("balance_celltypes = TRUE needs the cell type of every cell: ", sum(is.na(ct) | ct == ""),
+         " cells have none in metadata column '", ct_col,
+         "'. Set balance_celltypes = FALSE to detect the landmarks without balancing.", call. = FALSE)
+  }
+  ct
+}
+
+# Valley detection (P3 copy of ADTnorm::get_valley_location). With
+# legacy_args = TRUE the arguments are passed by position as scProtXpress
+# <= 0.2.0 did (bug D: neg_candidate_thres went to lower_peak_thres, the
+# arcsinh flag to neg_candidate_thres, and arcsinh_transform_flag stayed TRUE).
+# It is used only for queries against a background built with that version,
+# so that query and background detect valleys in the same way.
+.detect_valleys <- function(cell_x_adt, cell_x_feature, adt_marker_select, peak_mode_res,
+                            shoulder_valley, positive_peak, multi_sample_per_batch,
+                            valley_density_adjust, shoulder_valley_slope,
+                            neg_candidate_thres, arcsinh_transform_flag, legacy_args = FALSE) {
+  if (isTRUE(legacy_args)) {
+    return(.get_valley_location_patched(cell_x_adt, cell_x_feature, adt_marker_select, peak_mode_res,
+                                        shoulder_valley, positive_peak, multi_sample_per_batch,
+                                        valley_density_adjust, 20, shoulder_valley_slope,
+                                        neg_candidate_thres, arcsinh_transform_flag))
+  }
+  .get_valley_location_patched(cell_x_adt, cell_x_feature, adt_marker_select, peak_mode_res,
+                               shoulder_valley, positive_peak, multi_sample_per_batch,
+                               adjust = valley_density_adjust, min_fc = 20,
+                               shoulder_valley_slope = shoulder_valley_slope,
+                               neg_candidate_thres = neg_candidate_thres,
+                               arcsinh_transform_flag = arcsinh_transform_flag)
+}
+
+# bimodal_marker = "auto": every marker when balance_celltypes = TRUE, none
+# otherwise; "all": every marker; NULL: none; otherwise marker names. Resolved
+# to names before they are saved in the background, so queries find them.
+.resolve_bimodal_marker <- function(bimodal_marker, balance_celltypes, markers) {
+  if (is.null(bimodal_marker)) return(NULL)
+  if (identical(bimodal_marker, "auto")) return(if (isTRUE(balance_celltypes)) markers else NULL)
+  if (identical(bimodal_marker, "all")) return(markers)
+  bimodal_marker
+}
+
+# Checks of the balancing and alignment arguments (ADTprot_norm and
+# run_scProteinXpress).
+.check_balance_args <- function(balance_celltypes, balance_n, balance_min_cells,
+                                balance_replace, min_cells_align, seed) {
+  if (!(isTRUE(balance_celltypes) || isFALSE(balance_celltypes))) stop("balance_celltypes must be TRUE or FALSE")
+  n_ok <- (is.numeric(balance_n) && length(balance_n) == 1L && !is.na(balance_n) && balance_n >= 1) ||
+    identical(balance_n, "sample") || identical(balance_n, "maxK")
+  if (!n_ok) stop("balance_n must be a number >= 1 (cells per sample in the balanced copy), \"sample\" or \"maxK\"")
+  if (!is.numeric(balance_min_cells) || length(balance_min_cells) != 1L || is.na(balance_min_cells) ||
+      balance_min_cells < 1) stop("balance_min_cells must be a single integer >= 1")
+  if (!(isTRUE(balance_replace) || isFALSE(balance_replace))) stop("balance_replace must be TRUE or FALSE")
+  if (!is.numeric(min_cells_align) || length(min_cells_align) != 1L || is.na(min_cells_align) ||
+      min_cells_align < 5) stop("min_cells_align must be a single integer >= 5")
+  if (!is.numeric(seed) || length(seed) != 1L || is.na(seed)) stop("seed must be a single number")
+  invisible(TRUE)
+}
+
+# Appends the samples of one marker in the alignment log to `log` (data.frame)
+# and reports them in one message from the master process.
+.report_align_log <- function(log, res, stage, file.id, where) {
+  rows <- res$align_log
+  if (is.null(rows) || nrow(rows) == 0L) return(log)
+  na_rows <- rows[rows$reason != "no_valley_imputed", , drop = FALSE]
+  parts <- character(0)
+  if (nrow(na_rows) > 0L) {
+    tab <- table(factor(na_rows$reason, levels = c("too_small", "not_valid", "warp_failed")))
+    tab <- tab[tab > 0]
+    parts <- c(parts, sprintf("%d sample(s) set to NA (%s)", nrow(na_rows),
+                              paste0(names(tab), ": ", tab, collapse = ", ")))
+  }
+  n_imp <- sum(rows$reason == "no_valley_imputed")
+  if (n_imp > 0L) parts <- c(parts, sprintf("valley imputed in %d sample(s)", n_imp))
+  message("[i] ", where, ": marker ", res$marker_name, ": ", paste(parts, collapse = "; "), ".")
+  rbind(log, data.frame(stage = stage, file.id = file.id, marker = res$marker_name,
+                        sample = rows$sample, reason = rows$reason, stringsAsFactors = FALSE))
+}
+
+.write_align_log <- function(log, path) {
+  if (is.null(log)) log <- data.frame(stage = character(0), file.id = character(0), marker = character(0),
+                                      sample = character(0), reason = character(0))
+  utils::write.csv(log, path, row.names = FALSE)
+}
+
+# -----------------------------------------------------------------------------
+# Debug mode (debug = TRUE): what the alignment of every marker used, in
+# `outdir`:
+#   <file.id>_debug_landmarks.csv  one row per marker x sample: values, status
+#                                  of the sample and why, detected peaks and
+#                                  valley, landmarks used by the warp, which of
+#                                  them were imputed and how, targets;
+#   <file.id>_debug/<marker>.rds   detection and alignment objects of the
+#                                  marker; of the balanced copy, the cells
+#                                  drawn and how many times (no cell values);
+#   <file.id>_debug_settings.csv   settings of the run.
+# Statuses: aligned, no_values, too_small, not_valid, sqs_removed,
+# warp_failed, marker_not_aligned (reason: why the marker failed).
+# -----------------------------------------------------------------------------
+
+# Landmark names of a landmark_align_type.
+.landmark_names <- function(landmark_align_type) {
+  switch(landmark_align_type, negPeak = "neg", valley = "valley", negPeak_valley = c("neg", "valley"),
+         c("neg", "valley", "pos"))
+}
+
+# Cells of a balanced copy (cell ids of every draw, with repetitions): each
+# cell once, with its sample and the number of times it was drawn.
+.balanced_cells <- function(cell_id, sample) {
+  first <- !duplicated(cell_id)
+  data.frame(cell_id = cell_id[first], sample = as.character(sample[first]),
+             n = as.vector(table(factor(cell_id, levels = cell_id[first]))), stringsAsFactors = FALSE)
+}
+
+# Debug record of one marker: list(table = rows of _debug_landmarks.csv,
+# raw = content of <marker>.rds). `x`, `sample`: values (before alignment) and
+# samples of every cell. `reason`: why the marker was not aligned ("" if it
+# was). `d` (NULL for a marker not aligned), built by the marker worker:
+#   peaks_raw  detector output (rows: samples given to the detector);
+#   peaks      detected peaks used as landmarks, negative column first and
+#              positive column last (rows: every sample);
+#   valleys    detected valleys (rows: every sample);
+#   lm, used   landmark matrix and which of its landmarks each sample's warp
+#              used (rows: every sample, columns: .landmark_names(type));
+#   pos_method how a positive peak was imputed when it is not the detected one
+#              ("fill_na" by default);
+#   targets    targets of the warp; plus any other object for the .rds.
+.debug_marker <- function(stage, file.id, marker, x, sample, align_log, sqs_removed = character(0),
+                          reason = "", type = "negPeak_valley_posPeak", d = NULL) {
+  s  <- levels(sample)
+  ok <- is.finite(x)
+  na <- rep(NA_real_, length(s))
+  tab <- data.frame(stage = stage, file.id = file.id, marker = marker, sample = s,
+                    n_values = as.vector(table(sample[ok])),
+                    min = as.vector(tapply(x[ok], sample[ok], min)),
+                    max = as.vector(tapply(x[ok], sample[ok], max)),
+                    status = "aligned", reason = reason, n_peaks_detected = NA_integer_, peaks_detected = "",
+                    neg_detected = na, valley_detected = na, pos_detected = na, single_peak = "",
+                    landmarks_used = "", neg_landmark = na, valley_landmark = na, pos_landmark = na,
+                    imputed = "", target_neg = na, target_valley = na, target_pos = na,
+                    stringsAsFactors = FALSE)
+  tab$status[tab$n_values == 0] <- "no_values"
+  if (nzchar(reason)) tab$status[tab$n_values > 0] <- "marker_not_aligned"
+  lg <- align_log[align_log$reason != "no_valley_imputed", , drop = FALSE]
+  tab$status[match(lg$sample, s)] <- lg$reason
+  tab$status[s %in% sqs_removed] <- "sqs_removed"
+  if (is.null(d)) return(list(table = tab, raw = NULL))
+
+  det <- s[s %in% rownames(d$peaks_raw)]
+  pr  <- d$peaks_raw[det, , drop = FALSE]
+  tab$n_peaks_detected[match(det, s)] <- rowSums(!is.na(pr))
+  tab$peaks_detected[match(det, s)] <- apply(pr, 1, function(p) paste(signif(p[!is.na(p)], 6), collapse = ";"))
+  pk <- d$peaks[s, , drop = FALSE]
+  tab$neg_detected    <- unname(pk[, 1])
+  tab$valley_detected <- unname(d$valleys[s, 1])
+  if (ncol(pk) >= 2) tab$pos_detected <- unname(pk[, ncol(pk)])
+  one <- rowSums(!is.na(pk)) == 1L
+  tab$single_peak[one] <- ifelse(is.na(pk[one, 1]), "positive", "negative")
+
+  lm <- d$lm[s, , drop = FALSE]; used <- d$used[s, , drop = FALSE]
+  nm <- .landmark_names(type)[seq_len(ncol(lm))]
+  tab$landmarks_used <- apply(used, 1, function(u) paste(nm[u], collapse = ","))
+  pm <- if (is.null(d$pos_method)) rep(NA_character_, length(s)) else unname(d$pos_method[s])
+  imp <- matrix("", length(s), length(nm))
+  for (j in seq_along(nm)) {
+    tab[[paste0(nm[j], "_landmark")]] <- ifelse(used[, j], lm[, j], NA_real_)
+    tab[[paste0("target_", nm[j])]] <- d$targets[j]
+    det_j <- tab[[paste0(nm[j], "_detected")]]
+    imputed_j <- used[, j] & (is.na(det_j) | (nm[j] == "pos" & !is.na(pm)))
+    imp[imputed_j, j] <- if (nm[j] == "pos") paste0("pos:", ifelse(is.na(pm), "fill_na", pm)[imputed_j]) else nm[j]
+  }
+  tab$imputed <- apply(imp, 1, function(v) paste(v[nzchar(v)], collapse = ";"))
+  list(table = tab, raw = c(list(stage = stage, file.id = file.id, marker = marker, table = tab), d))
+}
+
+# Writes the debug records of a run (one per marker) and its settings.
+.write_debug <- function(records, settings, outdir, file.id) {
+  dir <- file.path(outdir, paste0(file.id, "_debug"))
+  dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+  for (r in records) {
+    if (!is.null(r$raw)) saveRDS(r$raw, file.path(dir, paste0(utils::URLencode(r$table$marker[1], reserved = TRUE), ".rds")))
+  }
+  utils::write.csv(do.call(rbind, lapply(records, `[[`, "table")),
+                   file.path(outdir, paste0(file.id, "_debug_landmarks.csv")), row.names = FALSE)
+  fmt <- function(v) {
+    if (is.null(v)) return("NULL")
+    u <- unlist(v); n <- names(u)
+    paste0(if (is.null(n)) "" else ifelse(nzchar(n), paste0(n, "="), ""), u, collapse = ";")
+  }
+  utils::write.csv(data.frame(setting = names(settings), value = vapply(settings, fmt, character(1))),
+                   file.path(outdir, paste0(file.id, "_debug_settings.csv")), row.names = FALSE)
+  message("[debug] ", file.id, ": ", file.path(outdir, paste0(file.id, "_debug_landmarks.csv")),
+          ", ", dir, ", ", file.path(outdir, paste0(file.id, "_debug_settings.csv")))
 }
 
 # -----------------------------------------------------------------------------
@@ -519,18 +855,18 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     file.id,
     landmark_align_type,
     midpoint_type,
-    target_landmark_location
+    target_landmark_location,
+    cell_type = NULL,
+    balance_n = 2000L,
+    balance_min_cells = 1L,
+    balance_replace = FALSE,
+    min_cells_align = 25L,
+    seed = 1234,
+    legacy_valley_args = FALSE,
+    debug = FALSE
 ){
   adt_marker_select      <- colnames(cell_x_adt)[adt_marker_index]      
   adt_marker_select_name <- original_marker_name[adt_marker_index]      
-  
-  out_skip_pre_sqs <- list(
-    marker_name       = adt_marker_select_name,
-    tmp_name          = adt_marker_select,
-    norm_col_override = NULL,
-    pars              = NULL,
-    sqs_rows          = list()
-  )
   
   if (quantile_clip < 1) {
     quant <- stats::quantile(cell_x_adt[, adt_marker_select], quantile_clip, na.rm = TRUE)
@@ -538,15 +874,15 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     cell_x_adt[clip_idx, adt_marker_select] <- NA
   }
   
-  valid_samples <- c()
-  for (s in levels(cell_x_feature$sample)) {
-    vals <- cell_x_adt[cell_x_feature$sample == s, adt_marker_select]
-    valid_vals <- vals[is.finite(vals)]
-    if (length(valid_vals) >= 5 && length(unique(valid_vals)) >= 3 && stats::var(valid_vals) > 1e-6) {
-      valid_samples <- c(valid_samples, s)
-    }
+  alignable     <- .alignable_samples(cell_x_adt[, adt_marker_select], cell_x_feature$sample, min_cells_align)
+  valid_samples <- alignable$valid
+  align_log     <- alignable$log
+  if (length(valid_samples) == 0) {
+    return(.marker_not_aligned(adt_marker_select_name, adt_marker_select,
+                               paste0("no sample with >= ", min_cells_align,
+                                      " finite values, >= 3 distinct values and non-zero variance"),
+                               align_log = align_log))
   }
-  if (length(valid_samples) == 0) return(out_skip_pre_sqs)
   
   valid_idx <- cell_x_feature$sample %in% valid_samples
   cell_x_adt_sub     <- cell_x_adt[valid_idx, , drop = FALSE]
@@ -555,47 +891,67 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   
   bwFac_smallest <- bw_smallest_bi
   
+  # Detection input: the balanced copy of every sample (cell_type given) or the
+  # samples themselves. The seed makes the copy and the jitter of
+  # get_peak_mode reproducible whatever the number of workers.
+  set.seed(seed)
+  bal_cells <- NULL
+  if (!is.null(cell_type)) {
+    det <- .balanced_detection_input(cell_x_adt_sub[, adt_marker_select], cell_x_feature_sub$sample,
+                                     cell_x_feature_sub$batch, cell_type[valid_idx], adt_marker_select,
+                                     balance_n, balance_min_cells, balance_replace)
+    det_adt <- det$cell_x_adt; det_feature <- det$cell_x_feature
+    if (debug) bal_cells <- .balanced_cells(rownames(cell_x_adt_sub)[det$keep], cell_x_feature_sub$sample[det$keep])
+    rm(det)
+  } else {
+    det_adt <- cell_x_adt_sub; det_feature <- cell_x_feature_sub
+  }
+
   peak_mode_res <- tryCatch({
     if (peak_type == "mode") {
-      .get_peak_mode_patched(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index,
+      .get_peak_mode_patched(det_adt, det_feature, adt_marker_select, adt_marker_index,
                     bwFac_smallest, bimodal_marker_index, trimodal_marker_index, positive_peak,
                     neg_candidate_thres, lower_peak_thres, arcsinh_transform_flag)
     } else {
-      ADTnorm::get_peak_midpoint(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index,
+      ADTnorm::get_peak_midpoint(det_adt, det_feature, adt_marker_select, adt_marker_index,
                         bwFac_smallest, bimodal_marker_index, trimodal_marker_index, positive_peak,
                         neg_candidate_thres, lower_peak_thres, arcsinh_transform_flag)
     }
-  }, error = function(e) {
-    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name,
-                   ": Peak detection failed -> ", conditionMessage(e)))
-    NULL
-  })
-  if (is.null(peak_mode_res)) return(out_skip_pre_sqs)
+  }, error = function(e) e)
+  if (inherits(peak_mode_res, "error")) {
+    return(.marker_not_aligned(adt_marker_select_name, adt_marker_select,
+                               paste0("peak detection failed: ", conditionMessage(peak_mode_res)),
+                               align_log = align_log))
+  }
   
   peak_valley_list <- tryCatch({
-    ADTnorm::get_valley_location(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, peak_mode_res,
-                        shoulder_valley, positive_peak, multi_sample_per_batch,
-                        valley_density_adjust, 20, shoulder_valley_slope,
-                        neg_candidate_thres, arcsinh_transform_flag)
-  }, error = function(e) {
-    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name, ": ",
-                   conditionMessage(e)))
-    NULL
-  })
-  if (is.null(peak_valley_list)) return(out_skip_pre_sqs)
+    .detect_valleys(det_adt, det_feature, adt_marker_select, peak_mode_res,
+                    shoulder_valley, positive_peak, multi_sample_per_batch,
+                    valley_density_adjust, shoulder_valley_slope,
+                    neg_candidate_thres, arcsinh_transform_flag, legacy_valley_args)
+  }, error = function(e) e)
+  if (inherits(peak_valley_list, "error")) {
+    return(.marker_not_aligned(adt_marker_select_name, adt_marker_select,
+                               paste0("valley detection failed: ", conditionMessage(peak_valley_list)),
+                               align_log = align_log))
+  }
   
   valley_location_res <- peak_valley_list$valley_location_list
   peak_landmark_list  <- peak_valley_list$peak_landmark_list
+  no_valley_samples   <- peak_valley_list$no_valley_samples
   
   if (detect_outlier_valley != FALSE) {
     valley_location_res <- tryCatch({
-      ADTnorm::detect_impute_outlier_valley(valley_location_res, adt_marker_select, cell_x_adt_sub,
-                                   cell_x_feature_sub, 3, detect_outlier_valley, 3, 0.75)
+      ADTnorm::detect_impute_outlier_valley(valley_location_res, adt_marker_select, det_adt,
+                                   det_feature, 3, detect_outlier_valley, 3, 0.75)
     }, error = function(e) valley_location_res)
   }
+  rm(det_adt, det_feature)
   
   sqs_rows <- list()
   norm_col_override <- cell_x_adt[, adt_marker_select]
+  ## Samples that are not aligned are NA, never left with unaligned values.
+  norm_col_override[!valid_idx] <- NA_real_
   
   peak_info_raw   <- .safe_to_matrix(peak_landmark_list,  valid_samples)
   valley_info_raw <- .safe_to_matrix(valley_location_res, valid_samples)
@@ -634,13 +990,9 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
       valley_location_res <- valley_info_raw[keep_mask, , drop = FALSE]
       
       if (length(valid_samples) == 0) {
-        return(list(
-          marker_name       = adt_marker_select_name,
-          tmp_name          = adt_marker_select,
-          norm_col_override = norm_col_override,
-          pars              = NULL,
-          sqs_rows          = sqs_rows
-        ))
+        return(.marker_not_aligned(adt_marker_select_name, adt_marker_select,
+                                   paste0("every sample failed the SQS filter (sqs_threshold = ",
+                                          sqs_threshold, ")"), sqs_rows, align_log))
       }
       
       valid_idx <- cell_x_feature$sample %in% valid_samples
@@ -666,41 +1018,37 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   landmark_matrix <- tryCatch({
     ADTnorm::landmark_fill_na(peak_mode_res_final, valley_location_res_final,
                      landmark_align_type, midpoint_type, neg_candidate_thres)
-  }, error = function(e) {
-    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name,
-                   ": Landmark alignment failed -> ", conditionMessage(e)))
-    NULL
-  })
-  if (is.null(landmark_matrix)) {
-    return(list(
-      marker_name       = adt_marker_select_name,
-      tmp_name          = adt_marker_select,
-      norm_col_override = norm_col_override,
-      pars              = NULL,
-      sqs_rows          = sqs_rows
-    ))
+  }, error = function(e) e)
+  if (inherits(landmark_matrix, "error")) {
+    return(.marker_not_aligned(adt_marker_select_name, adt_marker_select,
+                               paste0("landmark imputation failed: ", conditionMessage(landmark_matrix)),
+                               sqs_rows, align_log))
   }
   
+  pos_method <- NULL
+  if (landmark_align_type == "negPeak_valley_posPeak") {
+    imp <- .impute_positive_peak(landmark_matrix, cell_x_adt_sub[, adt_marker_select],
+                                 cell_x_feature_sub$sample, valid_samples)
+    landmark_matrix <- imp$landmark_matrix; pos_method <- imp$method
+    ## A positive peak imputed in every sample counts as a peak column for the targets.
+    if (ncol(peak_mode_res_final) == 1L) peak_mode_res_final <- cbind(peak_mode_res_final, NA_real_)
+  }
+
   target_landmark <- .build_target_landmark(target_landmark_location,
                                             landmark_align_type, peak_mode_res_final)
   
   align_res <- tryCatch({
-    ADTnorm::peak_alignment(cell_x_adt_sub[, adt_marker_select], cell_x_feature_sub,
-                   landmark_matrix[valid_samples, , drop = FALSE], target_landmark)
-  }, error = function(e) {
-    message(paste0("\n[!] Skipping normalization for ", adt_marker_select_name,
-                   ": Alignment failed -> ", conditionMessage(e)))
-    NULL
-  })
-  if (is.null(align_res)) {
-    return(list(
-      marker_name       = adt_marker_select_name,
-      tmp_name          = adt_marker_select,
-      norm_col_override = norm_col_override,
-      pars              = NULL,
-      sqs_rows          = sqs_rows
-    ))
+    .peak_alignment_by_sample(cell_x_adt_sub[, adt_marker_select], cell_x_feature_sub,
+                              landmark_matrix[valid_samples, , drop = FALSE], target_landmark)
+  }, error = function(e) e)
+  align_log <- rbind(align_log,
+                     .align_log_rows(intersect(no_valley_samples, valid_samples), "no_valley_imputed"))
+  if (inherits(align_res, "error")) {
+    return(.marker_not_aligned(adt_marker_select_name, adt_marker_select,
+                               paste0("landmark alignment failed: ", conditionMessage(align_res)),
+                               sqs_rows, align_log))
   }
+  align_log <- rbind(align_log, .align_log_rows(align_res$warp_failed, "warp_failed"))
   
   norm_col_override[valid_idx] <- .extract_align_field(align_res, "cell_x_adt_norm", pos = 1)
   
@@ -722,12 +1070,29 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     positive_peak         = positive_peak
   )
   
+  debug_rec <- NULL
+  if (debug) {
+    used <- matrix(rownames(landmark_matrix) %in% valid_samples, nrow(landmark_matrix), ncol(landmark_matrix),
+                   dimnames = list(rownames(landmark_matrix), NULL))
+    debug_rec <- .debug_marker("ref", file.id, adt_marker_select_name, cell_x_adt[, adt_marker_select],
+                               cell_x_feature$sample, align_log, setdiff(names(sqs_scores), valid_samples),
+                               type = landmark_align_type,
+                               d = list(peaks_raw = peak_mode_res, peaks = peak_mode_res_final,
+                                        valleys = valley_location_res_final, no_valley_samples = no_valley_samples,
+                                        lm = landmark_matrix, used = used, pos_method = pos_method,
+                                        targets = pars$fixed_target_landmark, warp_failed = align_res$warp_failed,
+                                        balanced_cells = bal_cells, bimodal_detector = length(bimodal_marker_index) > 0,
+                                        marker_pars = pars))
+  }
+
   list(
     marker_name       = adt_marker_select_name,
     tmp_name          = adt_marker_select,
     norm_col_override = norm_col_override,
     pars              = pars,
-    sqs_rows          = sqs_rows
+    sqs_rows          = sqs_rows,
+    align_log         = align_log,
+    debug             = debug_rec
   )
 }
 # -----------------------------------------------------------------------------
@@ -777,7 +1142,13 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     tissue_col = "tissue",
     dataset_col = "dataset",
     seed = 1234,
-    ncores = 1L){
+    ncores = 1L,
+    balance_celltypes = TRUE,
+    balance_n = 2000L,
+    balance_min_cells = 1L,
+    balance_replace = FALSE,
+    min_cells_align = 25L,
+    debug = FALSE){
   
   data_counts <- .as_dense_matrix(data_counts)
   metadata <- as.data.frame(metadata)
@@ -785,6 +1156,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   adt_in <- make_ADTnorm_input(data_counts, metadata, sample_col, batch_col)
   cell_x_adt <- adt_in$cell_x_adt
   cell_x_feature <- adt_in$cell_x_feature
+  balance_ct <- .balance_cell_types(cell_x_feature, ct_col, balance_celltypes)
   
   mode_info <- .detect_input_mode(cell_x_adt, neg_candidate_thres, is_transformed, verbose)
   arcsinh_transform_flag <- mode_info$arcsinh_transform_flag
@@ -805,6 +1177,7 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   
   if (!is.factor(cell_x_feature$sample)) cell_x_feature$sample <- factor(cell_x_feature$sample, levels = unique(cell_x_feature$sample))
   
+  bimodal_marker <- .resolve_bimodal_marker(bimodal_marker, balance_celltypes, all_marker_name)
   bimodal_marker_index <- which(all_marker_name %in% bimodal_marker)
   trimodal_marker_index <- if (!is.null(trimodal_marker)) which(all_marker_name %in% trimodal_marker) else NULL
   
@@ -827,7 +1200,10 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
       bimodal_marker = bimodal_marker, trimodal_marker = trimodal_marker, positive_peak = positive_peak,
       bw_smallest_bi = bw_smallest_bi, bw_smallest_tri = bw_smallest_tri, bw_smallest_adjustments = bw_smallest_adjustments,
       is_transformed_input = is_transformed, 
-      sqs_threshold = sqs_threshold, apply_sqs = apply_sqs
+      sqs_threshold = sqs_threshold, apply_sqs = apply_sqs,
+      balance_celltypes = balance_celltypes, balance_n = balance_n,
+      balance_min_cells = balance_min_cells, balance_replace = balance_replace,
+      min_cells_align = min_cells_align, alignment_version = .ALIGNMENT_VERSION
     ),
     markers = list()
   )
@@ -921,10 +1297,13 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   .pkgs_needed <- c("Matrix", "stats", "utils", "ADTnorm")
   .exports_needed <- c(
     ".run_one_marker_ref", ".safe_to_matrix", ".as_dense_matrix",
-    ".build_target_landmark", ".extract_align_field",
+    ".build_target_landmark", ".extract_align_field", ".impute_positive_peak",
     ".sqs_compute_per_sample", ".sqs_one_peak", ".sqs_two_peak",
     ".sqs_multi_peak", ".sqs_valley_deep_scaler", ".sqs_area_under_curve",
-    ".get_peak_mode_patched"
+    ".get_peak_mode_patched", ".peak_alignment_scprot", ".marker_not_aligned",
+    ".peak_alignment_by_sample", ".get_valley_location_patched", ".detect_valleys",
+    ".balance_index", ".balanced_detection_input", ".align_log_rows", ".alignable_samples",
+    ".debug_marker", ".balanced_cells", ".landmark_names"
   )
 
   `%OP%` <- if (use_parallel && !is.null(cl)) `%dopar%` else `%do%`
@@ -940,7 +1319,9 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   # feature-frame (sample, batch). The helper remains functional because
   # its internal calls (get_peak_mode, get_valley_location, etc.)
   # operate on cell_x_adt_sub[, adt_marker_select], which is exactly
-  # that column.
+  # that column. With balance_celltypes the cell type of every cell
+  # (balance_ct, a character vector) is also needed; the balanced copy
+  # is built inside the worker, for one marker at a time.
   # -------------------------------------------------------------------------
   sample_vec_full <- cell_x_feature$sample
   feature_slim    <- cell_x_feature[, intersect(c("sample", "batch"),
@@ -995,7 +1376,14 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
       file.id                  = file.id,
       landmark_align_type      = landmark_align_type,
       midpoint_type            = midpoint_type,
-      target_landmark_location = target_landmark_location
+      target_landmark_location = target_landmark_location,
+      cell_type                = balance_ct,
+      balance_n                = balance_n,
+      balance_min_cells        = balance_min_cells,
+      balance_replace          = balance_replace,
+      min_cells_align          = min_cells_align,
+      seed                     = seed,
+      debug                    = debug
     )
   }
   message(sprintf("[TIMING][ref] foreach elapsed: %.2fs",
@@ -1017,19 +1405,40 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     cl <- NULL
   }
   
-  for (res in marker_results) {
+  align_log <- NULL
+  debug_records <- list()
+  for (i in seq_along(marker_results)) {
+    res <- marker_results[[i]]
     if (inherits(res, "error") || is.null(res) || is.null(res$tmp_name)) {
       msg <- if (inherits(res, "error")) conditionMessage(res) else "invalid result"
-      message("[parallel] A worker failed: ", msg, " (skipping the marker).")
-      next
+      res <- .marker_not_aligned(original_marker_name[marker_payload[[i]]$adt_marker_index],
+                                 marker_payload[[i]]$tmp_name, paste0("worker failed: ", msg))
     }
-    if (!is.null(res$norm_col_override)) {
+    align_log <- .report_align_log(align_log, res, "ref", file.id, paste("Reference", file.id))
+    if (debug) {
+      debug_records[[i]] <- if (!is.null(res$not_aligned)) {
+        .debug_marker("ref", file.id, res$marker_name, cell_x_adt[, res$tmp_name], cell_x_feature$sample,
+                      res$align_log, reason = res$not_aligned, type = landmark_align_type)
+      } else res$debug
+    }
+    if (!is.null(res$not_aligned)) {
+      cell_x_adt_norm[, res$tmp_name] <- NA_real_
+      message("[!] Reference ", file.id, ": marker ", res$marker_name,
+              " not aligned, set to NA and left out of the reference (", res$not_aligned, ").")
+    } else if (!is.null(res$norm_col_override)) {
       cell_x_adt_norm[, res$tmp_name] <- res$norm_col_override
     }
     if (!is.null(res$pars)) {
       bg.prot.pars$markers[[res$marker_name]] <- res$pars
     }
     for (row in res$sqs_rows) .sqs_log_append(sqs_log_path, row)
+  }
+  .write_align_log(align_log, file.path(outdir, paste0(file.id, "_alignment_log.csv")))
+  if (debug) {
+    .write_debug(debug_records, c(list(stage = "ref", file.id = file.id,
+                                       package_version = as.character(utils::packageVersion("scProtXpress")),
+                                       seed = seed, ncores = ncores), bg.prot.pars$global_settings),
+                 outdir, file.id)
   }
   
   colnames(cell_x_adt_norm) <- original_marker_name
@@ -1113,14 +1522,10 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 # -----------------------------------------------------------------------------
 .run_one_marker_query <- function(marker_name, adt_marker_select, adt_marker_index,
                                   cell_x_adt, cell_x_feature, marker_pars, gs, mode_info,
-                                  file.id, sqs_threshold, apply_sqs) {
-  
-  out_skip <- list(
-    marker_name       = marker_name,
-    tmp_name          = adt_marker_select,
-    norm_col_override = NULL,  # Keep the philosophy: NULL = ignore in master
-    sqs_rows          = list()
-  )
+                                  file.id, sqs_threshold, apply_sqs,
+                                  cell_type = NULL, balance_n = 2000L, balance_min_cells = 1L,
+                                  balance_replace = FALSE, min_cells_align = 25L, seed = 1234,
+                                  legacy_valley_args = FALSE, single_peak = "nearest", debug = FALSE) {
   
   marker_vec <- cell_x_adt[, adt_marker_select]
   if (gs$quantile_clip < 1) {
@@ -1129,19 +1534,15 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     marker_vec[clip_idx] <- NA
   }
   
-  valid_samples <- c()
-  for (s in levels(cell_x_feature$sample)) {
-    vals <- marker_vec[cell_x_feature$sample == s]
-    valid_vals <- vals[is.finite(vals)]
-    if (length(valid_vals) >= 5 && length(unique(valid_vals)) >= 3 && stats::var(valid_vals) > 1e-6) {
-      valid_samples <- c(valid_samples, s)
-    }
-  }
+  alignable     <- .alignable_samples(marker_vec, cell_x_feature$sample, min_cells_align)
+  valid_samples <- alignable$valid
+  align_log     <- alignable$log
   
-  # If there are no valid samples, return the clipped vector and skip (as in the sequential branch)
   if (length(valid_samples) == 0) {
-    return(list(marker_name = marker_name, tmp_name = adt_marker_select,
-                norm_col_override = marker_vec, sqs_rows = list()))
+    return(.marker_not_aligned(marker_name, adt_marker_select,
+                               paste0("no sample with >= ", min_cells_align,
+                                      " finite values, >= 3 distinct values and non-zero variance"),
+                               align_log = align_log))
   }
   
   valid_idx <- cell_x_feature$sample %in% valid_samples
@@ -1150,41 +1551,90 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   cell_x_feature_sub <- cell_x_feature[valid_idx, , drop = FALSE]
   cell_x_feature_sub$sample <- factor(cell_x_feature_sub$sample, levels = valid_samples)
   
+  ## The background saves the bimodal / trimodal markers by name; their index
+  ## here is the column of this marker in the query.
+  bimodal_marker_index  <- if (marker_name %in% gs$bimodal_marker)  adt_marker_index else integer(0)
+  trimodal_marker_index <- if (marker_name %in% gs$trimodal_marker) adt_marker_index else integer(0)
+
+  # Detection input: balanced copy (cell_type given) or the samples themselves,
+  # as in .run_one_marker_ref().
+  set.seed(seed)
+  bal_cells <- NULL
+  if (!is.null(cell_type)) {
+    det <- .balanced_detection_input(marker_vec[valid_idx], cell_x_feature_sub$sample,
+                                     cell_x_feature_sub$batch, cell_type[valid_idx], adt_marker_select,
+                                     balance_n, balance_min_cells, balance_replace)
+    det_adt <- det$cell_x_adt; det_feature <- det$cell_x_feature
+    if (debug) bal_cells <- .balanced_cells(rownames(cell_x_adt_sub)[det$keep], cell_x_feature_sub$sample[det$keep])
+    rm(det)
+  } else {
+    det_adt <- cell_x_adt_sub; det_feature <- cell_x_feature_sub
+  }
+
   peak_mode_res <- tryCatch({
     if (marker_pars$peak_type == "mode") {
-      .get_peak_mode_patched(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index, marker_pars$bwFac_smallest, gs$bimodal_marker_index, gs$trimodal_marker_index, marker_pars$positive_peak, marker_pars$neg_candidate_thres, marker_pars$lower_peak_thres, mode_info$arcsinh_transform_flag)
+      .get_peak_mode_patched(det_adt, det_feature, adt_marker_select, adt_marker_index, marker_pars$bwFac_smallest, bimodal_marker_index, trimodal_marker_index, marker_pars$positive_peak, marker_pars$neg_candidate_thres, marker_pars$lower_peak_thres, mode_info$arcsinh_transform_flag)
     } else {
-      ADTnorm::get_peak_midpoint(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, adt_marker_index, marker_pars$bwFac_smallest, gs$bimodal_marker_index, gs$trimodal_marker_index, marker_pars$positive_peak, marker_pars$neg_candidate_thres, marker_pars$lower_peak_thres, mode_info$arcsinh_transform_flag)
+      ADTnorm::get_peak_midpoint(det_adt, det_feature, adt_marker_select, adt_marker_index, marker_pars$bwFac_smallest, bimodal_marker_index, trimodal_marker_index, marker_pars$positive_peak, marker_pars$neg_candidate_thres, marker_pars$lower_peak_thres, mode_info$arcsinh_transform_flag)
     }
-  }, error = function(e) NULL)
+  }, error = function(e) e)
   
-  if (is.null(peak_mode_res)) return(out_skip)
+  if (inherits(peak_mode_res, "error")) {
+    return(.marker_not_aligned(marker_name, adt_marker_select,
+                               paste0("peak detection failed: ", conditionMessage(peak_mode_res)),
+                               align_log = align_log))
+  }
   
   peak_mode_res_raw <- peak_mode_res
   ref_n <- length(marker_pars$fixed_target_landmark)
   peak_mode_res <- .coerce_peak_mode_to_reference(peak_mode_res, ref_n)
   
+  ## single_peak = "nearest": the single peak of a sample (negative column) is
+  ## its positive peak when it is nearer to the positive target of the
+  ## background than to the negative one. Its valley is then searched below the
+  ## peak, as ADTnorm does for the samples given in positive_peak.
+  positive_peak <- marker_pars$positive_peak
+  pos_single <- character(0)
+  if (single_peak == "nearest" && ref_n == 3L) {
+    tl <- marker_pars$fixed_target_landmark
+    p  <- peak_mode_res[, 1]
+    pos_single <- valid_samples[which(is.na(peak_mode_res[, 2]) & abs(p - tl[3]) < abs(p - tl[1]))]
+    positive_peak <- list(ADT_index = c(positive_peak$ADT_index, rep(adt_marker_index, length(pos_single))),
+                          sample    = c(positive_peak$sample, pos_single))
+  }
+  
   peak_valley_list <- tryCatch(
-    ADTnorm::get_valley_location(cell_x_adt_sub, cell_x_feature_sub, adt_marker_select, peak_mode_res, marker_pars$shoulder_valley, marker_pars$positive_peak, marker_pars$multi_sample_per_batch, marker_pars$valley_density_adjust, 20, marker_pars$shoulder_valley_slope, marker_pars$neg_candidate_thres, mode_info$arcsinh_transform_flag),
-    error = function(e) NULL
+    .detect_valleys(det_adt, det_feature, adt_marker_select, peak_mode_res,
+                    marker_pars$shoulder_valley, positive_peak, marker_pars$multi_sample_per_batch,
+                    marker_pars$valley_density_adjust, marker_pars$shoulder_valley_slope,
+                    marker_pars$neg_candidate_thres, mode_info$arcsinh_transform_flag, legacy_valley_args),
+    error = function(e) e
   )
   
-  if (is.null(peak_valley_list)) return(out_skip)
+  if (inherits(peak_valley_list, "error")) {
+    return(.marker_not_aligned(marker_name, adt_marker_select,
+                               paste0("valley detection failed: ", conditionMessage(peak_valley_list)),
+                               align_log = align_log))
+  }
   
   valley_location_res_raw   <- peak_valley_list$valley_location_list
   peak_landmark_list_raw    <- peak_valley_list$peak_landmark_list
   valley_location_res <- peak_valley_list$valley_location_list
   peak_landmark_list <- .coerce_peak_mode_to_reference(peak_valley_list$peak_landmark_list, ref_n)
+  no_valley_samples   <- peak_valley_list$no_valley_samples
   
   if (marker_pars$detect_outlier_valley != FALSE) {
     valley_location_res <- tryCatch(
-      ADTnorm::detect_impute_outlier_valley(valley_location_res, adt_marker_select, cell_x_adt_sub, cell_x_feature_sub, 3, marker_pars$detect_outlier_valley, 3, 0.75),
+      ADTnorm::detect_impute_outlier_valley(valley_location_res, adt_marker_select, det_adt, det_feature, 3, marker_pars$detect_outlier_valley, 3, 0.75),
       error = function(e) NULL
     )
   }
+  rm(det_adt, det_feature)
   
   sqs_rows <- list()
   norm_col_override <- cell_x_adt[, adt_marker_select] 
+  ## Samples that are not aligned are NA, never left with unaligned values.
+  norm_col_override[!valid_idx] <- NA_real_
   
   peak_info_raw_mat   <- .safe_to_matrix(peak_landmark_list_raw,  valid_samples)
   valley_info_raw_mat <- .safe_to_matrix(valley_location_res_raw, valid_samples)
@@ -1226,7 +1676,9 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
       }
       
       if (length(valid_samples) == 0) {
-        return(list(marker_name = marker_name, tmp_name = adt_marker_select, norm_col_override = norm_col_override, sqs_rows = sqs_rows))
+        return(.marker_not_aligned(marker_name, adt_marker_select,
+                                   paste0("every sample failed the SQS filter (sqs_threshold = ",
+                                          sqs_threshold, ")"), sqs_rows, align_log))
       }
       
       valid_idx <- cell_x_feature$sample %in% valid_samples
@@ -1239,6 +1691,12 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   
   full_samples <- levels(cell_x_feature$sample)
   peak_landmark_list <- .safe_to_matrix(peak_landmark_list, valid_samples)
+  ## Single positive peaks go to the positive column.
+  pos_single <- intersect(pos_single, valid_samples)
+  if (length(pos_single)) {
+    peak_landmark_list[pos_single, 2] <- peak_landmark_list[pos_single, 1]
+    peak_landmark_list[pos_single, 1] <- NA_real_
+  }
   pm_full <- matrix(NA_real_, nrow = length(full_samples), ncol = ncol(peak_landmark_list))
   rownames(pm_full) <- full_samples
   pm_full[valid_samples, ] <- peak_landmark_list
@@ -1252,26 +1710,88 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   
   landmark_matrix <- tryCatch(
     ADTnorm::landmark_fill_na(peak_mode_res_final, valley_location_res_final, gs$landmark_align_type, marker_pars$midpoint_type, marker_pars$neg_candidate_thres),
-    error = function(e) NULL
+    error = function(e) e
   )
   
-  if (is.null(landmark_matrix)) {
-    return(list(marker_name = marker_name, tmp_name = adt_marker_select, norm_col_override = norm_col_override, sqs_rows = sqs_rows))
+  if (inherits(landmark_matrix, "error")) {
+    return(.marker_not_aligned(marker_name, adt_marker_select,
+                               paste0("landmark imputation failed: ", conditionMessage(landmark_matrix)),
+                               sqs_rows, align_log))
   }
   
   fixed_target_landmark <- marker_pars$fixed_target_landmark
+  valley_filled <- landmark_matrix[, min(2L, ncol(landmark_matrix))]
   landmark_matrix <- .coerce_landmark_matrix_to_reference(landmark_matrix, fixed_target_landmark, marker_pars$neg_candidate_thres)
   
+  ## No positive peak is imputed in a query. Landmarks of each sample (rows of
+  ## `used`): all of them when both peaks were detected; negative peak and
+  ## valley when the positive peak was not (single negative peak or no peak);
+  ## valley and positive peak for a single positive peak, whose valley is not
+  ## moved above its imputed (unused) negative peak.
+  used <- matrix(TRUE, length(full_samples), ref_n, dimnames = list(full_samples, NULL))
+  used[!full_samples %in% valid_samples, ] <- FALSE
+  if (ref_n == 3L) {
+    no_pos <- is.na(peak_mode_res_final[, 2])
+    used[no_pos, 3] <- FALSE
+    pos_only <- !no_pos & is.na(peak_mode_res_final[, 1])
+    used[pos_only, 1] <- FALSE
+    landmark_matrix[pos_only, 2] <- valley_filled[pos_only]
+  }
   align_res <- tryCatch(
-    ADTnorm::peak_alignment(cell_x_adt_sub[, adt_marker_select], cell_x_feature_sub, landmark_matrix[valid_samples, , drop=FALSE], fixed_target_landmark, "fixed", marker_pars$warp_parameters),
-    error = function(e) NULL
+    .align_by_landmark_set(cell_x_adt_sub[, adt_marker_select], cell_x_feature_sub$sample,
+                           landmark_matrix[valid_samples, , drop = FALSE], used[valid_samples, , drop = FALSE],
+                           fixed_target_landmark, marker_pars$warp_parameters),
+    error = function(e) e
   )
+  align_log <- rbind(align_log,
+                     .align_log_rows(intersect(no_valley_samples, valid_samples), "no_valley_imputed"))
   
-  if (!is.null(align_res)) {
-    norm_col_override[valid_idx] <- .extract_align_field(align_res, "cell_x_adt_norm", pos = 1)
+  if (inherits(align_res, "error")) {
+    return(.marker_not_aligned(marker_name, adt_marker_select,
+                               paste0("landmark alignment failed: ", conditionMessage(align_res)),
+                               sqs_rows, align_log))
+  }
+  align_log <- rbind(align_log, .align_log_rows(align_res$warp_failed, "warp_failed"))
+  norm_col_override[valid_idx] <- .extract_align_field(align_res, "cell_x_adt_norm", pos = 1)
+  
+  debug_rec <- NULL
+  if (debug) {
+    debug_rec <- .debug_marker("query", file.id, marker_name, marker_vec, cell_x_feature$sample, align_log,
+                               setdiff(names(sqs_scores_q), valid_samples), type = gs$landmark_align_type,
+                               d = list(peaks_raw = peak_mode_res_raw, peaks = peak_mode_res_final,
+                                        valleys = valley_location_res_final, no_valley_samples = no_valley_samples,
+                                        lm = landmark_matrix, used = used, targets = fixed_target_landmark,
+                                        single_peak = single_peak, single_peak_positive = pos_single,
+                                        warp_failed = align_res$warp_failed, balanced_cells = bal_cells,
+                                        bimodal_detector = length(bimodal_marker_index) > 0,
+                                        marker_pars = marker_pars))
   }
   
-  list(marker_name = marker_name, tmp_name = adt_marker_select, norm_col_override = norm_col_override, sqs_rows = sqs_rows)
+  list(marker_name = marker_name, tmp_name = adt_marker_select, norm_col_override = norm_col_override,
+       sqs_rows = sqs_rows, align_log = align_log, debug = debug_rec)
+}
+
+# Query warp with a set of landmarks per sample (`used`: rows = samples of
+# `lm`, columns = landmarks). The samples with the same set are warped by
+# .peak_alignment_by_sample() onto the targets of those landmarks; with the
+# fixed warp parameters of the background every sample is warped on its own.
+# A set whose every sample fails goes to warp_failed; the call fails only when
+# every sample fails.
+.align_by_landmark_set <- function(x, sample, lm, used, targets, warp_parameters) {
+  key <- apply(used, 1, function(u) paste(which(u), collapse = ","))
+  out <- rep(NA_real_, length(x)); failed <- character(0); err <- NULL
+  for (k in unique(key)) {
+    sg <- rownames(used)[key == k]; cols <- which(used[sg[1], ])
+    i  <- sample %in% sg
+    r  <- tryCatch(.peak_alignment_by_sample(x[i], data.frame(sample = factor(as.character(sample[i]), levels = sg)),
+                                             lm[sg, cols, drop = FALSE], targets[cols], "fixed", warp_parameters),
+                   error = function(e) e)
+    if (inherits(r, "error")) { failed <- c(failed, sg); err <- conditionMessage(r); next }
+    out[i] <- r$cell_x_adt_norm
+    failed <- c(failed, r$warp_failed)
+  }
+  if (length(failed) == nrow(used)) stop(err)
+  list(cell_x_adt_norm = out, warp_failed = failed)
 }
 
 # -----------------------------------------------------------------------------
@@ -1285,7 +1805,8 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
                                 ## still inherit gs$apply_sqs from bg.prot.pars when
                                 ## available (see ADTprot_norm wrapper).
                                 sqs_threshold = 1.0, apply_sqs = "none",
-                                ncores = 1L){
+                                ncores = 1L, seed = 1234, ct_col = "cell.type",
+                                balance_celltypes_query = FALSE, single_peak = "nearest", debug = FALSE){
   ## Validate bg.prot.pars before touching anything else. An empty or
   ## malformed reference fitted-parameters list would otherwise surface as a
   ## confusing "subscript out of bounds" deep inside the foreach loop.
@@ -1327,6 +1848,32 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
   }
   
   if (!is.factor(cell_x_feature$sample)) cell_x_feature$sample <- factor(cell_x_feature$sample, levels = unique(cell_x_feature$sample))
+  
+  ## The detection settings come from the background (bimodal markers,
+  ## min_cells_align, valley call), so that background and query are aligned
+  ## with the same method. Cell-type balancing is off unless
+  ## balance_celltypes_query = TRUE, which uses the balancing settings of the
+  ## background. A background built with scProtXpress <= 0.2.0 (no
+  ## alignment_version) is followed as it was built: no cell-type balancing
+  ## and the valley call of that version. The rescue of failed warps and
+  ## missing valleys, the seed, min_cells_align (25 if the background does not
+  ## save it) and single_peak apply to every background.
+  legacy_bg         <- is.null(gs$alignment_version)
+  balance_q         <- !legacy_bg && isTRUE(balance_celltypes_query)
+  min_cells_align_q <- if (is.null(gs$min_cells_align)) 25L else gs$min_cells_align
+  balance_ct        <- .balance_cell_types(cell_x_feature, ct_col, balance_q)
+  if (legacy_bg) {
+    message("[!] Query ", file.id, ": the background was built with scProtXpress <= 0.2.0; the query is ",
+            "aligned as that background was (no cell-type balancing, valley call of that version). ",
+            "Rebuild the background with scProtXpress >= ", .ALIGNMENT_VERSION, " to use them.")
+  } else if (verbose) {
+    message(sprintf(paste0("[i] Query %s: balance_celltypes_query = %s%s, single_peak = \"%s\"; settings of the ",
+                           "background: bimodal detector on %d of %d markers, min_cells_align = %s."),
+                    file.id, balance_q,
+                    if (balance_q) sprintf(" (balance_n = %s, balance_min_cells = %s, balance_replace = %s)",
+                                           gs$balance_n, gs$balance_min_cells, gs$balance_replace) else "",
+                    single_peak, sum(ref_markers %in% gs$bimodal_marker), length(ref_markers), min_cells_align_q))
+  }
   
   original_marker_name <- colnames(cell_x_adt)
   colnames(cell_x_adt) <- paste0("tmpName", seq_len(ncol(cell_x_adt)))
@@ -1419,7 +1966,10 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     ".sqs_compute_per_sample", ".sqs_one_peak", ".sqs_two_peak",
     ".sqs_multi_peak", ".sqs_valley_deep_scaler", ".sqs_area_under_curve",
     ".coerce_peak_mode_to_reference", ".coerce_landmark_matrix_to_reference",
-    ".get_peak_mode_patched"
+    ".get_peak_mode_patched", ".peak_alignment_scprot", ".marker_not_aligned",
+    ".peak_alignment_by_sample", ".get_valley_location_patched", ".detect_valleys",
+    ".balance_index", ".balanced_detection_input", ".align_log_rows", ".alignable_samples",
+    ".align_by_landmark_set", ".debug_marker", ".balanced_cells", ".landmark_names"
   )
   
   `%OP%` <- if (use_parallel && !is.null(cl)) `%dopar%` else `%do%`
@@ -1446,7 +1996,16 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
       mode_info = mode_info,
       file.id = file.id,
       sqs_threshold = sqs_threshold,
-      apply_sqs = apply_sqs
+      apply_sqs = apply_sqs,
+      cell_type = balance_ct,
+      balance_n = gs$balance_n,
+      balance_min_cells = gs$balance_min_cells,
+      balance_replace = gs$balance_replace,
+      min_cells_align = min_cells_align_q,
+      seed = seed,
+      legacy_valley_args = legacy_bg,
+      single_peak = single_peak,
+      debug = debug
     )
   }
   message(sprintf("[TIMING][query] foreach elapsed: %.2fs",
@@ -1459,16 +2018,41 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
     cl <- NULL
   }
   
-  for (res in marker_results_q) {
+  align_log <- NULL
+  debug_records <- list()
+  for (i in seq_along(marker_results_q)) {
+    res <- marker_results_q[[i]]
     if (inherits(res, "error") || is.null(res) || is.null(res$tmp_name)) {
       msg <- if (inherits(res, "error")) conditionMessage(res) else "invalid result"
-      message("[parallel] A worker failed: ", msg, " (skipping the marker in query).")
-      next
+      res <- .marker_not_aligned(markers_to_run[i], name_map[[markers_to_run[i]]],
+                                 paste0("worker failed: ", msg))
     }
-    if (!is.null(res$norm_col_override)) {
+    align_log <- .report_align_log(align_log, res, "query", file.id,
+                                   paste0("Query ", file.id, " (", outdir, ")"))
+    if (debug) {
+      debug_records[[i]] <- if (!is.null(res$not_aligned)) {
+        .debug_marker("query", file.id, res$marker_name, cell_x_adt[, res$tmp_name], cell_x_feature$sample,
+                      res$align_log, reason = res$not_aligned, type = gs$landmark_align_type)
+      } else res$debug
+    }
+    if (!is.null(res$not_aligned)) {
+      cell_x_adt_norm[, res$tmp_name] <- NA_real_
+      message("[!] Query ", file.id, " (", outdir, "): marker ", res$marker_name,
+              " not aligned, set to NA (", res$not_aligned, ").")
+    } else if (!is.null(res$norm_col_override)) {
       cell_x_adt_norm[, res$tmp_name] <- res$norm_col_override
     }
     for (row in res$sqs_rows) .sqs_log_append(sqs_log_path_q, row)
+  }
+  .write_align_log(align_log, file.path(outdir, paste0(file.id, "_alignment_log.csv")))
+  if (debug) {
+    .write_debug(debug_records, c(list(stage = "query", file.id = file.id,
+                                       package_version = as.character(utils::packageVersion("scProtXpress")),
+                                       seed = seed, ncores = ncores, balance_celltypes_query = balance_q,
+                                       single_peak = single_peak, min_cells_align = min_cells_align_q,
+                                       legacy_background = legacy_bg),
+                                  stats::setNames(gs, paste0("background.", names(gs)))),
+                 outdir, file.id)
   }
   
   colnames(cell_x_adt_norm) <- markers_to_run
@@ -1486,6 +2070,11 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 #' enforces SLURM-aware parallelisation and the documented QC filters when
 #' invoked through `run_scProteinXpress()`.
 #'
+#' Ref: a positive peak that no sample detects is imputed in every sample with
+#' the median of the per-sample maxima, and a positive peak at or below the
+#' valley of its sample is replaced by the maximum of that sample. Query: no
+#' positive peak is imputed (see `single_peak`).
+#'
 #' @param data_counts proteins x cells matrix or Matrix.
 #' @param metadata data.frame; must contain `cell.id`, `sample`, `batch`.
 #' @param data.type "Ref" or "query".
@@ -1498,7 +2087,12 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 #' @param batch_col character(1); name of the metadata column holding batch ids.
 #' @param marker_to_process optional character vector; restrict normalisation to these markers.
 #' @param exclude_zeroes logical; ADTnorm parameter; passed through.
-#' @param bimodal_marker optional character vector; markers known to be bimodal.
+#' @param bimodal_marker markers on which the peak detector retries with a
+#'   finer bandwidth when it finds fewer than two peaks (ADTnorm's
+#'   `bimodal_marker`). `"auto"` (default): every marker when
+#'   `balance_celltypes = TRUE`, none otherwise; `"all"`: every marker;
+#'   `NULL`: none; or a character vector of marker names. Resolved to marker
+#'   names and saved in the reference, which queries follow.
 #' @param trimodal_marker optional character vector; markers known to be trimodal.
 #' @param positive_peak optional list; per-marker positive peak hints.
 #' @param bw_smallest_bi numeric; minimum bandwidth for bimodal markers.
@@ -1525,6 +2119,46 @@ make_ADTnorm_input <- function(counts_fxC, metadata, sample_col = "sample", batc
 #' @param do_subsample logical; apply hierarchical subsampling on the Ref branch.
 #' @param target_ct integer; cap of cells per cell type during Ref subsampling.
 #' @param ncores integer; number of cores for parallelisation.
+#' @param balance_celltypes logical (default `TRUE`). Detect the peaks and
+#'   valleys of every sample on a copy of the sample in which its cell types
+#'   are balanced (metadata column `cell.type`); the landmarks found there
+#'   warp the original cells. Ref only (queries: `balance_celltypes_query`).
+#' @param balance_n cells per sample in the balanced copy: a number (default
+#'   2000; 2000-5000 recommended by the evaluation of the method, 2000 is the
+#'   cheaper), `"sample"` (as many cells as the sample has) or `"maxK"` (every
+#'   cell type as large as the largest one). Each eligible cell type
+#'   contributes `balance_n / K` cells (K eligible types): a smaller type keeps
+#'   all its cells and is completed with draws with replacement, a larger one
+#'   is down-sampled. Samples with fewer than two eligible types are used as
+#'   they are.
+#' @param balance_min_cells integer (default 1); cell types with fewer cells in
+#'   a sample are left out of its balanced copy.
+#' @param balance_replace logical (default `FALSE`); down-sample larger cell
+#'   types with replacement instead of without.
+#' @param min_cells_align integer >= 5 (default 25). A sample is aligned for a
+#'   marker only with at least this many finite values, >= 3 distinct values
+#'   and non-zero variance; otherwise its values of that marker are set to NA.
+#'   Ref only: queries follow the reference.
+#' @param seed integer; seed of the landmark detection of every marker
+#'   (balanced copy and detector jitter) and of the Ref subsampling.
+#' @param balance_celltypes_query logical (default `FALSE`); query only.
+#'   Detect the landmarks of the query on cell-type balanced copies, with the
+#'   balancing settings saved in the reference.
+#' @param single_peak `"nearest"` (default) or `"negative"`; query only. A
+#'   query sample with a single peak is aligned with that peak and its valley,
+#'   without imputing the missing peak: `"nearest"` takes the peak as the
+#'   positive one when it is nearer to the positive target of the reference
+#'   than to the negative one (valley searched below the peak; warp onto the
+#'   valley and positive targets), and as the negative one otherwise (warp
+#'   onto the negative and valley targets); `"negative"` always takes it as
+#'   the negative one.
+#' @param debug logical (default `FALSE`). Write, in `outdir`, what the
+#'   alignment of every marker used: `<file.id>_debug_landmarks.csv` (one row
+#'   per marker and sample: status and why, detected peaks and valley,
+#'   landmarks used, which were imputed and how, targets),
+#'   `<file.id>_debug/<marker>.rds` (detection and alignment objects; cells of
+#'   the balanced copy and how many times each was drawn) and
+#'   `<file.id>_debug_settings.csv`.
 #' @return Normalised proteins x cells matrix.
 #' @export
 ADTprot_norm <- function(data_counts,
@@ -1539,7 +2173,7 @@ ADTprot_norm <- function(data_counts,
                          batch_col = "batch", 
                          marker_to_process = NULL, 
                          exclude_zeroes = FALSE, 
-                         bimodal_marker = NULL, 
+                         bimodal_marker = "auto", 
                          trimodal_marker = NULL, 
                          positive_peak = NULL, 
                          bw_smallest_bi = 1.1, 
@@ -1571,22 +2205,51 @@ ADTprot_norm <- function(data_counts,
                          # exposed to configure the filter size.
                          do_subsample = TRUE,
                          target_ct = 2000L,
-                         ncores = 1L){
+                         ncores = 1L,
+                         # --- Landmark detection on cell-type balanced copies ---
+                         balance_celltypes = TRUE,
+                         balance_n = 2000L,
+                         balance_min_cells = 1L,
+                         balance_replace = FALSE,
+                         min_cells_align = 25L,
+                         seed = 1234,
+                         balance_celltypes_query = FALSE,
+                         single_peak = c("nearest", "negative"),
+                         debug = FALSE){
+  .use_c_collate()
   data.type <- match.arg(data.type)
   apply_sqs <- match.arg(apply_sqs, choices = c("ref_only", "both", "none"))
+  single_peak <- match.arg(single_peak)
+  .check_balance_args(balance_celltypes, balance_n, balance_min_cells, balance_replace,
+                      min_cells_align, seed)
+  if (!(isTRUE(balance_celltypes_query) || isFALSE(balance_celltypes_query))) stop("balance_celltypes_query must be TRUE or FALSE")
+  if (!(isTRUE(debug) || isFALSE(debug))) stop("debug must be TRUE or FALSE")
   if (data.type == "Ref") {
-    res <- .ADTprot_norm_ref(data_counts, metadata, file.id, outdir, sample_col, 
-                             batch_col, marker_to_process, exclude_zeroes, 
-                             bimodal_marker, trimodal_marker, positive_peak, 
-                             bw_smallest_bi, bw_smallest_tri, bw_smallest_adjustments, 
-                             quantile_clip, peak_type, multi_sample_per_batch, 
-                             shoulder_valley, shoulder_valley_slope, valley_density_adjust, 
-                             landmark_align_type, midpoint_type, neg_candidate_thres, 
-                             lower_peak_thres, detect_outlier_valley, target_landmark_location, 
-                             clean_adt_name, override_landmark, verbose, saveData, is_transformed,
+    res <- .ADTprot_norm_ref(data_counts = data_counts, metadata = metadata, file.id = file.id,
+                             outdir = outdir, sample_col = sample_col, batch_col = batch_col,
+                             marker_to_process = marker_to_process, exclude_zeroes = exclude_zeroes,
+                             bimodal_marker = bimodal_marker, trimodal_marker = trimodal_marker,
+                             positive_peak = positive_peak, bw_smallest_bi = bw_smallest_bi,
+                             bw_smallest_tri = bw_smallest_tri,
+                             bw_smallest_adjustments = bw_smallest_adjustments,
+                             quantile_clip = quantile_clip, peak_type = peak_type,
+                             multi_sample_per_batch = multi_sample_per_batch,
+                             shoulder_valley = shoulder_valley,
+                             shoulder_valley_slope = shoulder_valley_slope,
+                             valley_density_adjust = valley_density_adjust,
+                             landmark_align_type = landmark_align_type, midpoint_type = midpoint_type,
+                             neg_candidate_thres = neg_candidate_thres,
+                             lower_peak_thres = lower_peak_thres,
+                             detect_outlier_valley = detect_outlier_valley,
+                             target_landmark_location = target_landmark_location,
+                             clean_adt_name = clean_adt_name, override_landmark = override_landmark,
+                             verbose = verbose, saveData = saveData, is_transformed = is_transformed,
                              sqs_threshold = sqs_threshold, apply_sqs = apply_sqs,
                              do_subsample = do_subsample, target_ct = target_ct,
-                             ncores = ncores)
+                             seed = seed, ncores = ncores,
+                             balance_celltypes = balance_celltypes, balance_n = balance_n,
+                             balance_min_cells = balance_min_cells, balance_replace = balance_replace,
+                             min_cells_align = min_cells_align, debug = debug)
   } else {
     if (!is.null(bg.prot.pars) && !is.null(bg.prot.pars$global_settings)) {
       gs <- bg.prot.pars$global_settings
@@ -1596,7 +2259,9 @@ ADTprot_norm <- function(data_counts,
     res <- .ADTprot_norm_query(data_counts, metadata, bg.prot.pars, file.id, outdir, sample_col, 
                                batch_col, marker_to_process, verbose, saveData, is_transformed,
                                sqs_threshold = sqs_threshold, apply_sqs = apply_sqs,
-                               ncores = ncores)
+                               ncores = ncores, seed = seed,
+                               balance_celltypes_query = balance_celltypes_query,
+                               single_peak = single_peak, debug = debug)
   }
   if (return) return(res)
   invisible(NULL)
@@ -1629,6 +2294,11 @@ ADTprot_norm <- function(data_counts,
 #' @param qc_outlier_cells "no" / "yes"; resolved upstream.
 #' @param qc_nmads MAD threshold for scuttle::isOutlier.
 #' @param ncores integer >= 1.
+#' @param seed integer; seed of the landmark detection of every marker. The
+#'   other detection settings (bimodal markers, `min_cells_align`, balancing
+#'   settings) are those saved in `bg.prot.pars`.
+#' @param balance_celltypes_query,single_peak,debug see [ADTprot_norm()]
+#'   (defaults `FALSE`, `"nearest"`, `FALSE`).
 #' @return Scaled proteins x cells matrix.
 #' @export
 PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback = NA,
@@ -1646,8 +2316,14 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
                               qc_outlier_cells = c("no", "yes"),
                               qc_nmads = 3,
                               # Parallelisation forwarded to ADTprot_norm
-                              ncores = 1L){
+                              ncores = 1L,
+                              seed = 1234,
+                              balance_celltypes_query = FALSE,
+                              single_peak = c("nearest", "negative"),
+                              debug = FALSE){
+  .use_c_collate()
   qc_outlier_cells <- match.arg(qc_outlier_cells)
+  single_peak <- match.arg(single_peak)
   dir_name <- dir
   if (!dir.exists(dir_name)) dir.create(dir_name, recursive = TRUE)
 
@@ -1684,7 +2360,11 @@ PrepQueryData_ADT <- function(query_dat, query_metadata, Ref_data, dir, sfback =
                            is_transformed = is_transformed,
                            sqs_threshold  = sqs_threshold,
                            apply_sqs      = apply_sqs,
-                           ncores         = ncores)
+                           ncores         = ncores,
+                           seed           = seed,
+                           balance_celltypes_query = balance_celltypes_query,
+                           single_peak    = single_peak,
+                           debug          = debug)
   } else {
     x_norm <- x_counts
   }
@@ -2454,10 +3134,16 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
                          sample_n, parallelize, ncores, num.boot.sample, fixseed,
                          bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
                          threshold_method = c("rectangle", "mixture", "quantile", "zscore")){
+  .use_c_collate()
   bootstrap_stratify <- match.arg(bootstrap_stratify)
   threshold_method   <- match.arg(threshold_method)
   data_norm <- .as_dense_matrix(data_norm)
   set.seed(fixseed)
+  # One seed per iteration, drawn here and set by the iteration itself: fork
+  # workers all start from the parent's RNG state, so without it most
+  # iterations repeated the same draws; with it the result does not depend
+  # on the number of workers.
+  iter_seeds <- sample.int(.Machine$integer.max, num.boot.sample)
   cl <- NULL
   
   # --- Robust ncores resolution cross-platform / cross-scheduler ---------
@@ -2635,6 +3321,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
                   "createThresholdDist_quantile", "createThresholdDist_zscore",
                   "swap_th", "GetThresholds")
   ) %OP% {
+    set.seed(iter_seeds[n])
     if (bootstrap_stratify == "none") {
       .RunBackComputations_pooled(data_norm, sample_n, file.id, threshold_method = threshold_method)
     } else {
@@ -2684,6 +3371,7 @@ RunBootstrap <- function(data_norm, dir_name, file.id, clusterids_vec, metadata,
 GetBackground <- function(data_norm, dir_name, file.id, metadata, sample_n, parallelize, ncores, num.boot.sample, fixseed,
                           bootstrap_stratify = c("none", "cell.type", "cell.type_tissue"),
                           threshold_method   = c("rectangle", "mixture", "quantile", "zscore")){
+  .use_c_collate()
   bootstrap_stratify <- match.arg(bootstrap_stratify)
   threshold_method   <- match.arg(threshold_method)
   if (identical(threshold_method, "mixture") && !requireNamespace("mclust", quietly = TRUE)) {
@@ -3211,14 +3899,23 @@ Create.sig.frame_by_donor <- function(discrete.mat, donor_ids){
 #'   contributing donors than this are forced to `"not.significant"`
 #'   rather than silently falling back to a pooled-cell test that offers no
 #'   real protection against pseudoreplication.
+#' @param fdr_method `NULL` (default: calls on the raw p-values) or `"BH"`:
+#'   `p_low` is Benjamini-Hochberg adjusted over the genes with enough
+#'   donors (`q_low`), then `p_high` over the genes that reach the
+#'   medium/high test only (`q_high`); the calls use the q-values and
+#'   `expr.level_raw` keeps the call on the raw p-values.
 #' @return data.frame: gene, per-donor-summed n.0/n.0.5/n.1 (for
 #'   comparability with `discrete.expr.levels()`'s output shape), n_donors,
-#'   p_low, p_high, expr.level.
+#'   p_low, p_high, expr.level (and q_low, q_high, expr.level_raw with
+#'   `fdr_method = "BH"`).
 #' @export
 discrete.expr.levels_donor <- function(by_donor, prob_low, prob_high,
                                        test_method = c("donor_t", "donor_wilcox", "design_effect"),
-                                       min_donors_for_call = 2L){
+                                       min_donors_for_call = 2L, fdr_method = NULL){
   test_method <- match.arg(test_method)
+  if (!is.null(fdr_method) && !identical(fdr_method, "BH")) {
+    stop('discrete.expr.levels_donor: fdr_method must be NULL or "BH".')
+  }
   if (prob_low  >= 1) prob_low  <- 1 - 1e-6
   if (prob_high >= 1) prob_high <- 1 - 1e-6
   if (prob_low  <= 0) prob_low  <- 1e-6
@@ -3281,38 +3978,62 @@ discrete.expr.levels_donor <- function(by_donor, prob_low, prob_high,
     )
   }
 
+  ## p_low for every gene with enough donors; p_high for every gene with
+  ## non-zero cells and no 0.5/1 tie (0.3.1: also when p_low is not
+  ## significant, so that the raw and the FDR calls can both be made).
   out <- lapply(genes, function(g) {
     n0_d  <- by_donor$n0[g, ]; n05_d <- by_donor$n05[g, ]; n1_d <- by_donor$n1[g, ]
     ntot_d <- n0_d + n05_d + n1_d
     nnz_d  <- n05_d + n1_d
     keep_d <- ntot_d > 0   # donors that actually contributed measured cells to this gene
     n_donors <- sum(keep_d)
-
     N0 <- sum(n0_d); N05 <- sum(n05_d); N1 <- sum(n1_d)
     row <- data.frame(gene = g, n.0 = N0, n.0.5 = N05, n.1 = N1, n_donors = n_donors,
-                      stringsAsFactors = FALSE)
-
-    if (n_donors < min_donors_for_call) {
-      row$p_low <- NA_real_; row$p_high <- NA_real_; row$expr.level <- "not.significant"
-      return(row)
-    }
-
-    p_low  <- .test_low(nnz_d[keep_d], ntot_d[keep_d])
+                      p_low = NA_real_, p_high = NA_real_, stringsAsFactors = FALSE)
+    if (n_donors < min_donors_for_call) return(row)
+    p_low <- .test_low(nnz_d[keep_d], ntot_d[keep_d])
     if (is.na(p_low)) { n_fallback <<- n_fallback + 1L; p_low <- 1 }
     row$p_low <- p_low
-
-    if (p_low > 0.05 || (N05 + N1) == 0) {
-      row$p_high <- NA_real_; row$expr.level <- "low"; return(row)
+    if ((N05 + N1) > 0 && N05 != N1) {
+      p_high <- .test_high(n05_d[keep_d], nnz_d[keep_d])
+      if (is.na(p_high)) { n_fallback <<- n_fallback + 1L; p_high <- 1 }
+      row$p_high <- p_high
     }
-    if (N05 == N1) { row$p_high <- NA_real_; row$expr.level <- "not.significant"; return(row) }
-
-    p_high <- .test_high(n05_d[keep_d], nnz_d[keep_d])
-    if (is.na(p_high)) { n_fallback <<- n_fallback + 1L; p_high <- 1 }
-    row$p_high <- p_high
-    row$expr.level <- if (p_high < 0.05) "medium" else "high"
     row
   })
   result <- do.call(rbind, out)
+  ## calls: too few donors -> not.significant; p_low > 0.05 or no non-zero
+  ## cell -> low; 0.5/1 tie -> not.significant; p_high < 0.05 -> medium;
+  ## else high. With fdr_method = "BH" (0.3.1) the cut-offs are applied to
+  ## q_low (BH of p_low over the genes with enough donors) and q_high (BH of
+  ## p_high over the genes that reach the medium/high test only), and
+  ## `expr.level_raw` keeps the call on the raw p-values.
+  enough <- !is.na(result$p_low)
+  nnz <- result$n.0.5 + result$n.1
+  tie <- result$n.0.5 == result$n.1
+  level_from <- function(cut_low, cut_high) {
+    lvl <- rep("not.significant", nrow(result))
+    low <- enough & (nnz == 0 | cut_low > 0.05)
+    lvl[low] <- "low"
+    rest2 <- enough & !low & !tie
+    med <- rest2 & (cut_high < 0.05)
+    lvl[med] <- "medium"
+    lvl[rest2 & !med] <- "high"
+    list(lvl = lvl, rest2 = rest2)
+  }
+  if (identical(fdr_method, "BH")) {
+    q_low <- rep(NA_real_, nrow(result))
+    q_low[enough] <- stats::p.adjust(result$p_low[enough], method = "BH")
+    tested_high <- level_from(q_low, rep(1, nrow(result)))$rest2
+    q_high <- rep(NA_real_, nrow(result))
+    q_high[tested_high] <- stats::p.adjust(result$p_high[tested_high], method = "BH")
+    result$expr.level <- level_from(q_low, q_high)$lvl
+    result$q_low  <- q_low
+    result$q_high <- q_high
+    result$expr.level_raw <- level_from(result$p_low, result$p_high)$lvl
+  } else {
+    result$expr.level <- level_from(result$p_low, result$p_high)$lvl
+  }
   attr(result, "n_fallback_to_pooled") <- n_fallback
   if (n_fallback > 0) {
     message(sprintf("[discrete.expr.levels_donor] %d/%d genes had a degenerate donor test (e.g. all donors identical) and were scored NA/conservative; check attr(result, 'n_fallback_to_pooled').",
@@ -3419,32 +4140,32 @@ discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL,
   ## `is_low`/`med` are actually thresholded against below -- 0.05 on the
   ## raw p when fdr_method is NULL (byte-identical to the original), or the
   ## BH q-value when fdr_method = "BH".
-  if (identical(fdr_method, "BH")) {
-    q_low  <- stats::p.adjust(p_low,  method = "BH")
-    q_high <- stats::p.adjust(p_high, method = "BH")
-    cutoff_low  <- q_low
-    cutoff_high <- q_high
-  } else {
-    q_low  <- rep(NA_real_, length(p_low))
-    q_high <- rep(NA_real_, length(p_high))
-    cutoff_low  <- p_low
-    cutoff_high <- p_high
-  }
-
-  lvl <- character(length(nnz))
-  is_low <- (nnz == 0) | (cutoff_low > 0.05)
-  lvl[is_low] <- "low"
-
-  rest <- !is_low
-  if (any(rest)){
-    tied <- rest & (n05 == n1)
+  ## 0.3.1: with fdr_method = "BH" the FDR is controlled in two stages, within
+  ## the genes of this population: q_low = BH of p_low over every gene; then
+  ## q_high = BH of p_high over the genes that reach the medium/high test only
+  ## (not low after q_low, not tied). `expr.level_raw` keeps the call on the
+  ## raw p-values.
+  level_from <- function(cut_low, cut_high) {
+    lvl <- character(length(nnz))
+    is_low <- (nnz == 0) | (cut_low > 0.05)
+    lvl[is_low] <- "low"
+    tied <- !is_low & (n05 == n1)
     lvl[tied] <- "not.significant"
-    rest2 <- rest & !tied
-    if (any(rest2)){
-      med <- rest2 & (cutoff_high < 0.05)
-      lvl[med]            <- "medium"
-      lvl[rest2 & !med]   <- "high"
-    }
+    rest2 <- !is_low & !tied
+    med <- rest2 & (cut_high < 0.05)
+    lvl[med]          <- "medium"
+    lvl[rest2 & !med] <- "high"
+    list(lvl = lvl, rest2 = rest2)
+  }
+  if (identical(fdr_method, "BH")) {
+    q_low  <- stats::p.adjust(p_low, method = "BH")
+    tested_high <- level_from(q_low, rep(1, length(q_low)))$rest2
+    q_high <- rep(NA_real_, length(p_high))
+    q_high[tested_high] <- stats::p.adjust(p_high[tested_high], method = "BH")
+    lvl <- level_from(q_low, q_high)$lvl
+    lvl_raw <- level_from(p_low, p_high)$lvl
+  } else {
+    lvl <- level_from(p_low, p_high)$lvl
   }
 
   ## --- new, additive: force "not.significant" for populations too small
@@ -3458,6 +4179,7 @@ discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL,
   if (min_n_for_call > 0L) {
     too_small <- (ntot < min_n_for_call) | (nnz > 0 & nnz < min_n_for_call)
     lvl[too_small] <- "not.significant"
+    if (identical(fdr_method, "BH")) lvl_raw[too_small] <- "not.significant"
   }
 
   tbl$expr.level <- lvl
@@ -3466,6 +4188,7 @@ discrete.expr.levels <- function(tbl, zs, prob_low = NULL, prob_high = NULL,
   if (identical(fdr_method, "BH")) {
     tbl$q_low  <- q_low
     tbl$q_high <- q_high
+    tbl$expr.level_raw <- lvl_raw
   }
   if (isTRUE(effect_size)) {
     tbl$effect_size_low  <- (nnz / ntot) - prob_low
@@ -4035,7 +4758,8 @@ downsample_reference_stability <- function(
                                               min.coverage.fraction.sigframe,
                                               audit_path,
                                               sig_test_method = "pooled",
-                                              min_donors_for_call = 2L){
+                                              min_donors_for_call = 2L,
+                                              fdr_method = NULL){
   ## Prefer the canonical 'donor' column (present whenever pop_meta was
   ## persisted by a version of run_scProteinXpress() that resolves
   ## donor_col). Fall back to 'sample' for Query_<pop>/*_Metadata.rds files
@@ -4061,7 +4785,8 @@ downsample_reference_stability <- function(
                                 min.coverage.fraction.sigframe = min.coverage.fraction.sigframe,
                                 audit_csv_path = audit_path)
     return(discrete.expr.levels(sig.res[[1]], sig.res[[2]],
-                                prob_low = sig.res[[3]], prob_high = sig.res[[4]]))
+                                prob_low = sig.res[[3]], prob_high = sig.res[[4]],
+                                fdr_method = fdr_method))
   }
 
   ## Donor-aware path. Note: this still derives prob_low/prob_high from the
@@ -4080,10 +4805,12 @@ downsample_reference_stability <- function(
             sum(is.na(donor_ids)), "/", length(donor_ids), " unmatched) -- falling ",
             "back to the pooled-cell test for this population.", call. = FALSE)
     return(discrete.expr.levels(sig.res[[1]], sig.res[[2]],
-                                prob_low = sig.res[[3]], prob_high = sig.res[[4]]))
+                                prob_low = sig.res[[3]], prob_high = sig.res[[4]],
+                                fdr_method = fdr_method))
   }
   by_donor <- Create.sig.frame_by_donor(discretised_data, donor_ids)
   discrete.expr.levels_donor(by_donor, sig.res[[3]], sig.res[[4]],
                              test_method = sig_test_method,
-                             min_donors_for_call = min_donors_for_call)
+                             min_donors_for_call = min_donors_for_call,
+                             fdr_method = fdr_method)
 }
